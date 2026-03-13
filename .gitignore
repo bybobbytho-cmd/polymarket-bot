@@ -1,0 +1,36 @@
+# Secrets - NEVER commit these
+.env
+*.env
+.env.*
+config/secrets.json
+**/private_key.txt
+**/keys.json
+credentials.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+
+# Local environment
+.DS_Store
+*.log
+logs/
+data/
+temp/
+*.db
+*.sqlite
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
