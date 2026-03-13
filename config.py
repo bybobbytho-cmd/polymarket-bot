@@ -35,7 +35,8 @@ class Config:
         # Bot settings
         self.max_stake_percent = float(os.getenv("MAX_STAKE_PERCENT", "0.05"))
         self.daily_loss_limit_percent = float(os.getenv("DAILY_LOSS_LIMIT_PERCENT", "0.05"))
-        self.min_stake_usd = float(os.getenv("MIN_STAKE_USD", "0.50"))
+        # FIXED: Minimum stake set to $1.00 (Polymarket minimum)
+        self.min_stake_usd = float(os.getenv("MIN_STAKE_USD", "1.00"))
         
         # Validate required credentials
         self._validate()
@@ -247,6 +248,7 @@ def test_bot():
         config = Config()
         print(f"✅ Configuration loaded")
         print(f"   Proxy: {config.proxy_address[:10]}...{config.proxy_address[-8:]}")
+        print(f"   Min stake: ${config.min_stake_usd}")  # This will show 1.00 now
     except Exception as e:
         print(f"❌ Config error: {e}")
         return
