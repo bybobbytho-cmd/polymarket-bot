@@ -1,7 +1,7 @@
 """
 Telegram Bot for Polymarket - Handles all commands and interactions
 All commands are single words (no spaces) for fast, error-free use
-Uses orderbook API for reliable price fetching
+Uses same price fetching method as working bot
 """
 
 import os
@@ -46,77 +46,58 @@ COMMAND_MAP = {
 }
 
 # ============================================================
-# PRICE FETCHING FUNCTION - FIXED VERSION USING ORDERBOOK
+# PRICE FETCHING FUNCTION - MATCHES WORKING BOT
 # ============================================================
 
 def fetch_market_price(market_data):
     """
-    Fetch current price from orderbook - most reliable method
-    Based on Polymarket docs: https://docs.polymarket.com
+    Fetch current price using method that matches working bot
+    Source: Gamma event-by-slug + CLOB midpoints
     """
     if not market_data:
         return None, None
     
-    # Get token_id (needed for orderbook queries)
-    token_id = None
-    if market_data.get('markets') and len(market_data['markets']) > 0:
-        token_ids = market_data['markets'][0].get('clobTokenIds')
-        if token_ids and len(token_ids) > 0:
-            token_id = token_ids[0]  # First token is usually YES/UP
+    # Get the market from the event
+    if not market_data.get('markets') or len(market_data['markets']) == 0:
+        return None, None
     
-    if not token_id:
-        # Try alternative location
-        if market_data.get('clob_token_ids') and len(market_data['clob_token_ids']) > 0:
-            token_id = market_data['clob_token_ids'][0]
+    market = market_data['markets'][0]
+    condition_id = market.get('conditionId')
     
-    if not token_id:
-        print(f"No token_id found for market")
+    if not condition_id:
         return None, None
     
     try:
-        # Orderbook endpoint - public, no authentication required
-        url = f"{CLOB_API}/book"
-        params = {"token_id": token_id}
-        response = requests.get(url, params=params, timeout=5)
+        # Query CLOB markets to get token IDs for this condition
+        url = f"{CLOB_API}/markets"
+        response = requests.get(url, timeout=10)
         
         if response.status_code == 200:
-            book = response.json()
+            all_markets = response.json().get('data', [])
             
-            # Extract best bid and ask
-            bids = book.get('bids', [])
-            asks = book.get('asks', [])
-            
-            if bids and asks:
-                best_bid = float(bids[0]['price'])
-                best_ask = float(asks[0]['price'])
-                
-                # Midpoint is the market's implied probability
-                midpoint = (best_bid + best_ask) / 2
-                
-                # Return as YES price, NO price
-                return midpoint, 1.0 - midpoint
-            elif bids:
-                # Only bids - market might be one-sided
-                bid_price = float(bids[0]['price'])
-                return bid_price, None
-            elif asks:
-                # Only asks
-                ask_price = float(asks[0]['price'])
-                return None, ask_price
-        
-        # Fallback to midpoint endpoint
-        url = f"{CLOB_API}/midpoint"
-        params = {"token_id": token_id}
-        response = requests.get(url, params=params, timeout=5)
-        
-        if response.status_code == 200:
-            data = response.json()
-            if 'midpoint' in data:
-                midpoint = float(data['midpoint'])
-                return midpoint, 1.0 - midpoint
-                
+            # Find the market with matching condition_id
+            for clob_market in all_markets:
+                if clob_market.get('condition_id') == condition_id:
+                    tokens = clob_market.get('tokens', [])
+                    if tokens and len(tokens) > 0:
+                        # First token is YES/UP
+                        token_id = tokens[0].get('token_id')
+                        
+                        if token_id:
+                            # Get midpoint price from CLOB
+                            mid_url = f"{CLOB_API}/midpoint"
+                            mid_params = {"token_id": token_id}
+                            mid_response = requests.get(mid_url, params=mid_params, timeout=5)
+                            
+                            if mid_response.status_code == 200:
+                                mid_data = mid_response.json()
+                                if 'midpoint' in mid_data:
+                                    midpoint = float(mid_data['midpoint'])
+                                    # Ensure price is within valid range
+                                    midpoint = max(0.01, min(0.99, midpoint))
+                                    return midpoint, 1.0 - midpoint
     except Exception as e:
-        print(f"Orderbook error for token {token_id}: {e}")
+        print(f"Price fetch error: {e}")
     
     return None, None
 
@@ -129,22 +110,15 @@ def format_market_response(market_data, market_type):
     if not market_data:
         return f"❌ No active {market_type} market found"
     
-    # Fetch live prices using orderbook
+    # Fetch live prices using working method
     up_price, down_price = fetch_market_price(market_data)
     
-    if up_price is None and down_price is None:
+    if up_price is None or down_price is None:
         return f"❌ Could not fetch prices for {market_type}"
     
-    # Handle case where only one side has price
-    if up_price is None:
-        up_cents = 0
-        down_cents = down_price * 100 if down_price else 0
-    elif down_price is None:
-        up_cents = up_price * 100
-        down_cents = 0
-    else:
-        up_cents = up_price * 100
-        down_cents = down_price * 100
+    # Convert to cents for display
+    up_cents = up_price * 100
+    down_cents = down_price * 100
     
     # Get title
     title = market_data.get('title', '')
@@ -165,17 +139,12 @@ def format_market_response(market_data, market_type):
     except:
         time_str = "Unknown time"
     
-    # Build response
-    response = f"📊 *{title}*\n"
-    response += f"⏱️ {time_str}\n\n"
-    response += f"📈 UP: {up_cents:.1f}¢\n"
-    response += f"📉 DOWN: {down_cents:.1f}¢\n\n"
-    
-    market_id = market_data.get('market_id')
-    if not market_id and market_data.get('markets'):
-        market_id = market_data['markets'][0].get('id')
-    if market_id:
-        response += f"🆔 Market ID: `{market_id}`\n"
+    # Build response matching working bot format
+    response = f"📈 *{title}*\n"
+    response += f"Slug: `{market_data.get('slug', 'unknown')}`\n\n"
+    response += f"UP (mid): {up_cents:.0f}¢\n"
+    response += f"DOWN (mid): {down_cents:.0f}¢\n\n"
+    response += f"Source: Gamma event-by-slug + CLOB midpoints"
     
     return response
 
