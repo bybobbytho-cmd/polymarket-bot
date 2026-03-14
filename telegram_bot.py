@@ -1,6 +1,7 @@
 """
 Telegram Bot for Polymarket - Handles all commands and interactions
 All commands are single words (no spaces) for fast, error-free use
+Uses orderbook API for reliable price fetching
 """
 
 import os
@@ -45,76 +46,77 @@ COMMAND_MAP = {
 }
 
 # ============================================================
-# PRICE FETCHING FUNCTION - FIXED VERSION
+# PRICE FETCHING FUNCTION - FIXED VERSION USING ORDERBOOK
 # ============================================================
 
 def fetch_market_price(market_data):
     """
-    Fetch current price from CLOB API midpoint endpoint
-    This is more reliable than parsing event data
+    Fetch current price from orderbook - most reliable method
+    Based on Polymarket docs: https://docs.polymarket.com
     """
     if not market_data:
         return None, None
     
-    # Get market_id from various possible locations
-    market_id = None
-    if market_data.get('market_id'):
-        market_id = market_data['market_id']
-    elif market_data.get('markets') and len(market_data['markets']) > 0:
-        market_id = market_data['markets'][0].get('id')
-    
-    # Also try to get token_id (more reliable for price fetching)
+    # Get token_id (needed for orderbook queries)
     token_id = None
     if market_data.get('markets') and len(market_data['markets']) > 0:
         token_ids = market_data['markets'][0].get('clobTokenIds')
         if token_ids and len(token_ids) > 0:
-            # First token ID is usually for YES/UP outcome
-            token_id = token_ids[0]
+            token_id = token_ids[0]  # First token is usually YES/UP
     
-    # Try to fetch from CLOB API if we have token_id
-    if token_id:
-        try:
-            # Try midpoint endpoint first
-            url = f"{CLOB_API}/midpoint"
-            params = {"token_id": token_id}
-            response = requests.get(url, params=params, timeout=5)
-            
-            if response.status_code == 200:
-                data = response.json()
-                if 'midpoint' in data:
-                    price = float(data['midpoint'])
-                    return price, 1.0 - price
-            
-            # If midpoint fails, try price-history with small fidelity
-            url = f"{CLOB_API}/prices-history"
-            params = {
-                "market": token_id,
-                "interval": "max",
-                "fidelity": 5  # 5 minutes
-            }
-            response = requests.get(url, params=params, timeout=5)
-            
-            if response.status_code == 200:
-                data = response.json()
-                if data.get('history') and len(data['history']) > 0:
-                    latest = data['history'][-1]
-                    price = float(latest['p'])
-                    return price, 1.0 - price
-        except:
-            pass
+    if not token_id:
+        # Try alternative location
+        if market_data.get('clob_token_ids') and len(market_data['clob_token_ids']) > 0:
+            token_id = market_data['clob_token_ids'][0]
     
-    # Fallback to Gamma API prices
+    if not token_id:
+        print(f"No token_id found for market")
+        return None, None
+    
     try:
-        prices = None
-        if market_data.get('prices'):
-            prices = market_data['prices']
-        elif market_data.get('markets') and len(market_data['markets']) > 0:
-            prices = market_data['markets'][0].get('outcomePrices')
+        # Orderbook endpoint - public, no authentication required
+        url = f"{CLOB_API}/book"
+        params = {"token_id": token_id}
+        response = requests.get(url, params=params, timeout=5)
         
-        if prices and len(prices) >= 2:
-            return float(prices[0]), float(prices[1])
-    except:
-        pass
+        if response.status_code == 200:
+            book = response.json()
+            
+            # Extract best bid and ask
+            bids = book.get('bids', [])
+            asks = book.get('asks', [])
+            
+            if bids and asks:
+                best_bid = float(bids[0]['price'])
+                best_ask = float(asks[0]['price'])
+                
+                # Midpoint is the market's implied probability
+                midpoint = (best_bid + best_ask) / 2
+                
+                # Return as YES price, NO price
+                return midpoint, 1.0 - midpoint
+            elif bids:
+                # Only bids - market might be one-sided
+                bid_price = float(bids[0]['price'])
+                return bid_price, None
+            elif asks:
+                # Only asks
+                ask_price = float(asks[0]['price'])
+                return None, ask_price
+        
+        # Fallback to midpoint endpoint
+        url = f"{CLOB_API}/midpoint"
+        params = {"token_id": token_id}
+        response = requests.get(url, params=params, timeout=5)
+        
+        if response.status_code == 200:
+            data = response.json()
+            if 'midpoint' in data:
+                midpoint = float(data['midpoint'])
+                return midpoint, 1.0 - midpoint
+                
+    except Exception as e:
+        print(f"Orderbook error for token {token_id}: {e}")
     
     return None, None
 
@@ -127,15 +129,22 @@ def format_market_response(market_data, market_type):
     if not market_data:
         return f"❌ No active {market_type} market found"
     
-    # Fetch live prices
+    # Fetch live prices using orderbook
     up_price, down_price = fetch_market_price(market_data)
     
-    if up_price is None:
+    if up_price is None and down_price is None:
         return f"❌ Could not fetch prices for {market_type}"
     
-    # Convert to cents for display
-    up_cents = up_price * 100
-    down_cents = down_price * 100
+    # Handle case where only one side has price
+    if up_price is None:
+        up_cents = 0
+        down_cents = down_price * 100 if down_price else 0
+    elif down_price is None:
+        up_cents = up_price * 100
+        down_cents = 0
+    else:
+        up_cents = up_price * 100
+        down_cents = down_price * 100
     
     # Get title
     title = market_data.get('title', '')
