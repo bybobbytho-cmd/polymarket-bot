@@ -1,7 +1,7 @@
 """
 Telegram Bot for Polymarket - Handles all commands and interactions
 All commands are single words (no spaces) for fast, error-free use
-Uses same price fetching method as working bot
+Uses 3-attempt price fetching strategy from working bot
 """
 
 import os
@@ -46,58 +46,114 @@ COMMAND_MAP = {
 }
 
 # ============================================================
-# PRICE FETCHING FUNCTION - MATCHES WORKING BOT
+# PRICE FETCHING FUNCTION - MATCHES WORKING BOT EXACTLY
 # ============================================================
 
 def fetch_market_price(market_data):
     """
-    Fetch current price using method that matches working bot
-    Source: Gamma event-by-slug + CLOB midpoints
+    Fetch current price using 3-attempt strategy from working bot
+    Attempt 1: GET /midpoints?token_ids=...
+    Attempt 2: POST /midpoints with JSON body
+    Attempt 3: Individual GET /midpoint calls
     """
     if not market_data:
         return None, None
     
-    # Get the market from the event
-    if not market_data.get('markets') or len(market_data['markets']) == 0:
+    # Get token IDs from event (same as working bot)
+    token_ids = []
+    if market_data.get('markets') and len(market_data['markets']) > 0:
+        market = market_data['markets'][0]
+        token_ids = market.get('clobTokenIds', [])
+    
+    if not token_ids or len(token_ids) < 2:
         return None, None
     
-    market = market_data['markets'][0]
-    condition_id = market.get('conditionId')
+    # Convert to strings (important for API)
+    token_ids = [str(id) for id in token_ids[:2]]
     
-    if not condition_id:
-        return None, None
-    
+    # ===== ATTEMPT 1: GET /midpoints with query params =====
     try:
-        # Query CLOB markets to get token IDs for this condition
-        url = f"{CLOB_API}/markets"
-        response = requests.get(url, timeout=10)
+        url = f"{CLOB_API}/midpoints"
+        params = {"token_ids": ",".join(token_ids)}
+        response = requests.get(url, params=params, timeout=5)
         
         if response.status_code == 200:
-            all_markets = response.json().get('data', [])
+            data = response.json()
+            up_raw = data.get(token_ids[0])
+            down_raw = data.get(token_ids[1])
             
-            # Find the market with matching condition_id
-            for clob_market in all_markets:
-                if clob_market.get('condition_id') == condition_id:
-                    tokens = clob_market.get('tokens', [])
-                    if tokens and len(tokens) > 0:
-                        # First token is YES/UP
-                        token_id = tokens[0].get('token_id')
-                        
-                        if token_id:
-                            # Get midpoint price from CLOB
-                            mid_url = f"{CLOB_API}/midpoint"
-                            mid_params = {"token_id": token_id}
-                            mid_response = requests.get(mid_url, params=mid_params, timeout=5)
-                            
-                            if mid_response.status_code == 200:
-                                mid_data = mid_response.json()
-                                if 'midpoint' in mid_data:
-                                    midpoint = float(mid_data['midpoint'])
-                                    # Ensure price is within valid range
-                                    midpoint = max(0.01, min(0.99, midpoint))
-                                    return midpoint, 1.0 - midpoint
+            if up_raw is not None and down_raw is not None:
+                try:
+                    up_price = float(up_raw)
+                    down_price = float(down_raw)
+                    # Ensure prices are within valid range
+                    up_price = max(0.01, min(0.99, up_price))
+                    down_price = max(0.01, min(0.99, down_price))
+                    return up_price, down_price
+                except:
+                    pass
     except Exception as e:
-        print(f"Price fetch error: {e}")
+        print(f"Attempt 1 failed: {e}")
+    
+    # ===== ATTEMPT 2: POST /midpoints with JSON body =====
+    try:
+        url = f"{CLOB_API}/midpoints"
+        payload = [{"token_id": id} for id in token_ids]
+        response = requests.post(
+            url,
+            json=payload,
+            headers={"Content-Type": "application/json"},
+            timeout=5
+        )
+        
+        if response.status_code == 200:
+            data = response.json()
+            up_raw = data.get(token_ids[0])
+            down_raw = data.get(token_ids[1])
+            
+            if up_raw is not None and down_raw is not None:
+                try:
+                    up_price = float(up_raw)
+                    down_price = float(down_raw)
+                    up_price = max(0.01, min(0.99, up_price))
+                    down_price = max(0.01, min(0.99, down_price))
+                    return up_price, down_price
+                except:
+                    pass
+    except Exception as e:
+        print(f"Attempt 2 failed: {e}")
+    
+    # ===== ATTEMPT 3: Individual GET /midpoint calls =====
+    try:
+        # Get UP token price
+        up_url = f"{CLOB_API}/midpoint"
+        up_params = {"token_id": token_ids[0]}
+        up_response = requests.get(up_url, params=up_params, timeout=5)
+        
+        # Get DOWN token price
+        down_url = f"{CLOB_API}/midpoint"
+        down_params = {"token_id": token_ids[1]}
+        down_response = requests.get(down_url, params=down_params, timeout=5)
+        
+        if up_response.status_code == 200 and down_response.status_code == 200:
+            up_data = up_response.json()
+            down_data = down_response.json()
+            
+            # Try different possible response formats
+            up_mid = up_data.get('mid_price') or up_data.get('midPrice') or up_data.get('midpoint')
+            down_mid = down_data.get('mid_price') or down_data.get('midPrice') or down_data.get('midpoint')
+            
+            if up_mid is not None and down_mid is not None:
+                try:
+                    up_price = float(up_mid)
+                    down_price = float(down_mid)
+                    up_price = max(0.01, min(0.99, up_price))
+                    down_price = max(0.01, min(0.99, down_price))
+                    return up_price, down_price
+                except:
+                    pass
+    except Exception as e:
+        print(f"Attempt 3 failed: {e}")
     
     return None, None
 
@@ -110,7 +166,7 @@ def format_market_response(market_data, market_type):
     if not market_data:
         return f"❌ No active {market_type} market found"
     
-    # Fetch live prices using working method
+    # Fetch live prices using working bot's method
     up_price, down_price = fetch_market_price(market_data)
     
     if up_price is None or down_price is None:
