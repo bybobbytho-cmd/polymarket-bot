@@ -28,6 +28,7 @@ class Config:
 
         # Telegram
         self.telegram_token = os.getenv("TELEGRAM_TOKEN")
+        self.telegram_chat_id = os.getenv("TELEGRAM_CHAT_ID")
 
         # RPC URL for Polygon (for signing transactions)
         self.polygon_rpc_url = os.getenv("POLYGON_RPC_URL", "https://polygon-rpc.com")
@@ -211,21 +212,27 @@ class PolymarketAPI:
 class TelegramAlert:
     """Send alerts to Telegram."""
 
-    def __init__(self, token):
+    def __init__(self, token, chat_id=None):
         self.token = token
+        self.chat_id = chat_id
         self.base_url = f"https://api.telegram.org/bot{token}"
 
-    def send_message(self, chat_id, message):
-        """Send a message to a specific chat."""
+    def send_message(self, message, chat_id=None):
+        """Send a message to Telegram."""
+        send_to = chat_id or self.chat_id
+        if not send_to:
+            print("⚠️ No chat_id provided for Telegram message")
+            return False
+
         url = f"{self.base_url}/sendMessage"
         data = {
-            "chat_id": chat_id,
+            "chat_id": send_to,
             "text": message,
             "parse_mode": "HTML"
         }
 
         try:
-            response = requests.post(url, data=data)
+            response = requests.post(url, data=data, timeout=10)
             response.raise_for_status()
             return True
         except Exception as e:
@@ -272,6 +279,36 @@ def test_bot():
     else:
         print("   ❌ No Telegram token found")
     # =====================================
+
+    # ===== GET CHAT ID =====
+    print("\n📋 CHECKING FOR CHAT ID:")
+    if config.telegram_token:
+        try:
+            url = f"https://api.telegram.org/bot{config.telegram_token}/getUpdates"
+            r = requests.get(url, timeout=15)
+            if r.status_code == 200:
+                data = r.json()
+                if data['result']:
+                    chat_id = data['result'][0]['message']['chat']['id']
+                    print(f"   ✅ Found Chat ID: {chat_id}")
+                    print(f"   🔑 Add this to Railway variables as:")
+                    print(f"      TELEGRAM_CHAT_ID={chat_id}")
+                    
+                    # Test sending a message if we have chat_id
+                    if config.telegram_chat_id:
+                        print(f"\n📤 Testing message send to configured chat_id...")
+                        telegram = TelegramAlert(config.telegram_token, config.telegram_chat_id)
+                        telegram.send_message("🚀 Railway bot is online and testing!")
+                else:
+                    print("   ⚠️ No messages found. Send a message to @Vengance48bot on Telegram and try again.")
+                    print("   📱 After sending a message, redeploy to see your Chat ID.")
+            else:
+                print(f"   ❌ Error: {r.status_code}")
+        except Exception as e:
+            print(f"   ❌ Error getting updates: {e}")
+    else:
+        print("   ❌ No Telegram token available")
+    # ======================
 
     # Test minute market discovery
     print("\n🔍 Discovering minute markets...")
