@@ -26,6 +26,7 @@ from journal import PolymarketJournal
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 GAMMA_API = "https://gamma-api.polymarket.com"
+CLOB_API = "https://clob.polymarket.com"
 
 # Initialize components
 market_finder = MinuteMarketFinder()
@@ -44,6 +45,80 @@ COMMAND_MAP = {
 }
 
 # ============================================================
+# PRICE FETCHING FUNCTION - FIXED VERSION
+# ============================================================
+
+def fetch_market_price(market_data):
+    """
+    Fetch current price from CLOB API midpoint endpoint
+    This is more reliable than parsing event data
+    """
+    if not market_data:
+        return None, None
+    
+    # Get market_id from various possible locations
+    market_id = None
+    if market_data.get('market_id'):
+        market_id = market_data['market_id']
+    elif market_data.get('markets') and len(market_data['markets']) > 0:
+        market_id = market_data['markets'][0].get('id')
+    
+    # Also try to get token_id (more reliable for price fetching)
+    token_id = None
+    if market_data.get('markets') and len(market_data['markets']) > 0:
+        token_ids = market_data['markets'][0].get('clobTokenIds')
+        if token_ids and len(token_ids) > 0:
+            # First token ID is usually for YES/UP outcome
+            token_id = token_ids[0]
+    
+    # Try to fetch from CLOB API if we have token_id
+    if token_id:
+        try:
+            # Try midpoint endpoint first
+            url = f"{CLOB_API}/midpoint"
+            params = {"token_id": token_id}
+            response = requests.get(url, params=params, timeout=5)
+            
+            if response.status_code == 200:
+                data = response.json()
+                if 'midpoint' in data:
+                    price = float(data['midpoint'])
+                    return price, 1.0 - price
+            
+            # If midpoint fails, try price-history with small fidelity
+            url = f"{CLOB_API}/prices-history"
+            params = {
+                "market": token_id,
+                "interval": "max",
+                "fidelity": 5  # 5 minutes
+            }
+            response = requests.get(url, params=params, timeout=5)
+            
+            if response.status_code == 200:
+                data = response.json()
+                if data.get('history') and len(data['history']) > 0:
+                    latest = data['history'][-1]
+                    price = float(latest['p'])
+                    return price, 1.0 - price
+        except:
+            pass
+    
+    # Fallback to Gamma API prices
+    try:
+        prices = None
+        if market_data.get('prices'):
+            prices = market_data['prices']
+        elif market_data.get('markets') and len(market_data['markets']) > 0:
+            prices = market_data['markets'][0].get('outcomePrices')
+        
+        if prices and len(prices) >= 2:
+            return float(prices[0]), float(prices[1])
+    except:
+        pass
+    
+    return None, None
+
+# ============================================================
 # HELPER FUNCTIONS
 # ============================================================
 
@@ -52,28 +127,15 @@ def format_market_response(market_data, market_type):
     if not market_data:
         return f"❌ No active {market_type} market found"
     
-    # Parse prices - they might be in different locations
-    prices = None
+    # Fetch live prices
+    up_price, down_price = fetch_market_price(market_data)
     
-    # Try different places where prices might be
-    if market_data.get('prices'):
-        prices = market_data['prices']
-    elif market_data.get('markets') and len(market_data['markets']) > 0:
-        prices = market_data['markets'][0].get('outcomePrices')
-    elif market_data.get('outcomePrices'):
-        prices = market_data['outcomePrices']
+    if up_price is None:
+        return f"❌ Could not fetch prices for {market_type}"
     
-    # Convert prices to cents
-    try:
-        if prices and len(prices) >= 2:
-            up_price = float(prices[0]) * 100
-            down_price = float(prices[1]) * 100
-        else:
-            up_price = 0
-            down_price = 0
-    except:
-        up_price = 0
-        down_price = 0
+    # Convert to cents for display
+    up_cents = up_price * 100
+    down_cents = down_price * 100
     
     # Get title
     title = market_data.get('title', '')
@@ -97,8 +159,8 @@ def format_market_response(market_data, market_type):
     # Build response
     response = f"📊 *{title}*\n"
     response += f"⏱️ {time_str}\n\n"
-    response += f"📈 UP: {up_price:.0f}¢\n"
-    response += f"📉 DOWN: {down_price:.0f}¢\n\n"
+    response += f"📈 UP: {up_cents:.1f}¢\n"
+    response += f"📉 DOWN: {down_cents:.1f}¢\n\n"
     
     market_id = market_data.get('market_id')
     if not market_id and market_data.get('markets'):
