@@ -1,5 +1,5 @@
 """
-Telegram Bot for Polymarket – Robust price fetching with fallback attempts
+Telegram Bot for Polymarket – Uses proven REST API method (working bot style)
 """
 
 import os
@@ -33,20 +33,12 @@ COMMAND_MAP = {
 }
 
 # ----------------------------------------------------------------------
-# Robust price fetcher – exactly like the working bot
+# Price fetcher – exact same logic as your working bot
 # ----------------------------------------------------------------------
 def fetch_market_price(market_data):
-    """
-    Tries three methods in order:
-      1) GET /midpoints?token_ids=...
-      2) POST /midpoints (JSON body)
-      3) Individual GET /midpoint per token
-    Returns (up_price, down_price) or (None, None) on total failure.
-    """
     if not market_data:
         return None, None
 
-    # Extract token IDs (as strings)
     token_ids = []
     if market_data.get('markets') and len(market_data['markets']) > 0:
         market = market_data['markets'][0]
@@ -56,34 +48,11 @@ def fetch_market_price(market_data):
 
     token_ids = [str(id) for id in token_ids[:2]]
 
-    # ------------------------------------------------------------------
-    # Attempt 1: GET /midpoints?token_ids=a,b
-    # ------------------------------------------------------------------
-    try:
-        url = f"{CLOB_API}/midpoints"
-        params = {"token_ids": ",".join(token_ids)}
-        resp = requests.get(url, params=params, timeout=5)
-        if resp.status_code == 200:
-            data = resp.json()
-            up = data.get(token_ids[0])
-            down = data.get(token_ids[1])
-            if up is not None and down is not None:
-                return float(up), float(down)
-    except Exception as e:
-        print(f"GET /midpoints failed: {e}")
-
-    # ------------------------------------------------------------------
-    # Attempt 2: POST /midpoints (JSON payload)
-    # ------------------------------------------------------------------
+    # POST /midpoints – this is what the working bot uses
     try:
         url = f"{CLOB_API}/midpoints"
         payload = [{"token_id": tid} for tid in token_ids]
-        resp = requests.post(
-            url,
-            json=payload,
-            headers={"Content-Type": "application/json"},
-            timeout=5
-        )
+        resp = requests.post(url, json=payload, headers={"Content-Type": "application/json"}, timeout=5)
         if resp.status_code == 200:
             data = resp.json()
             up = data.get(token_ids[0])
@@ -93,35 +62,10 @@ def fetch_market_price(market_data):
     except Exception as e:
         print(f"POST /midpoints failed: {e}")
 
-    # ------------------------------------------------------------------
-    # Attempt 3: individual GET /midpoint calls
-    # ------------------------------------------------------------------
-    try:
-        up_price = down_price = None
-
-        url1 = f"{CLOB_API}/midpoint"
-        params1 = {"token_id": token_ids[0]}
-        r1 = requests.get(url1, params=params1, timeout=5)
-        if r1.status_code == 200:
-            d1 = r1.json()
-            up_price = d1.get('mid_price') or d1.get('midPrice') or d1.get('midpoint')
-
-        url2 = f"{CLOB_API}/midpoint"
-        params2 = {"token_id": token_ids[1]}
-        r2 = requests.get(url2, params=params2, timeout=5)
-        if r2.status_code == 200:
-            d2 = r2.json()
-            down_price = d2.get('mid_price') or d2.get('midPrice') or d2.get('midpoint')
-
-        if up_price is not None and down_price is not None:
-            return float(up_price), float(down_price)
-    except Exception as e:
-        print(f"Individual GET /midpoint failed: {e}")
-
     return None, None
 
 # ----------------------------------------------------------------------
-# Helper to format market response (unchanged except using new fetcher)
+# Format response
 # ----------------------------------------------------------------------
 def format_market_response(market_data, market_type):
     if not market_data:
@@ -155,11 +99,11 @@ def format_market_response(market_data, market_type):
     response += f"Slug: `{market_data.get('slug', 'unknown')}`\n\n"
     response += f"UP (mid): {up_cents:.0f}¢\n"
     response += f"DOWN (mid): {down_cents:.0f}¢\n\n"
-    response += f"Source: Gamma + CLOB (multi‑attempt)"
+    response += f"Source: CLOB /midpoints (POST)"
     return response
 
 # ----------------------------------------------------------------------
-# Command handlers (unchanged – only the price fetching above changed)
+# Command handlers (unchanged – include them all)
 # ----------------------------------------------------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     help_text = """
@@ -258,7 +202,6 @@ async def trending(update: Update, context: ContextTypes.DEFAULT_TYPE):
         resp = requests.get(url, params=params, timeout=10)
         if resp.status_code == 200:
             markets = resp.json()
-            # simple formatting (same as before)
             out = "🔥 *Trending Markets*\n\n"
             for i, m in enumerate(markets[:5]):
                 title = m.get('title', 'Unknown')[:50]
@@ -270,7 +213,7 @@ async def trending(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"❌ Error: {str(e)[:50]}")
 
-# ---------- search commands (unchanged) ----------
+# ---------- search commands ----------
 async def searchbtc(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await perform_search(update, "bitcoin")
 async def searcheth(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -297,7 +240,7 @@ async def perform_search(update: Update, term: str):
     except Exception as e:
         await update.message.reply_text(f"❌ Error: {str(e)[:50]}")
 
-# ---------- portfolio commands (unchanged) ----------
+# ---------- portfolio commands ----------
 async def pnl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     summary = journal.get_today_summary()
     stats = summary['stats']
@@ -404,7 +347,7 @@ def main():
     app.add_handler(CommandHandler("threshold10000", threshold10000))
     for cmd in COMMAND_MAP:
         app.add_handler(CommandHandler(cmd, updown_handler))
-    print("🤖 Telegram bot started (robust price fetcher).")
+    print("🤖 Telegram bot started (REST API method).")
     app.run_polling()
 
 if __name__ == "__main__":
