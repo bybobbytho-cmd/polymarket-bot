@@ -1,5 +1,5 @@
 """
-Telegram Bot for Polymarket – Uses proven REST API method (working bot style)
+Telegram Bot for Polymarket – Uses working bot as price oracle
 """
 
 import os
@@ -17,74 +17,38 @@ from journal import PolymarketJournal
 load_dotenv()
 
 TOKEN = os.getenv("TELEGRAM_TOKEN")
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-GAMMA_API = "https://gamma-api.polymarket.com"
-CLOB_API = "https://clob.polymarket.com"
+ORACLE_URL = os.getenv("PRICE_ORACLE_URL")
 
 market_finder = MinuteMarketFinder()
 config = Config()
 journal = PolymarketJournal(paper_mode=True)
 
 COMMAND_MAP = {
-    "updownbtc5m": "btc-updown-5m",
-    "updownbtc15m": "btc-updown-15m",
-    "updowneth5m": "eth-updown-5m",
-    "updowneth15m": "eth-updown-15m",
+    "updownbtc5m": ("btc", "5m"),
+    "updownbtc15m": ("btc", "15m"),
+    "updowneth5m": ("eth", "5m"),
+    "updowneth15m": ("eth", "15m"),
 }
 
-# ----------------------------------------------------------------------
-# Price fetcher – exact same logic as your working bot
-# ----------------------------------------------------------------------
-def fetch_market_price(market_data):
-    if not market_data:
+def fetch_price_from_oracle(asset, interval):
+    if not ORACLE_URL:
         return None, None
-
-    token_ids = []
-    if market_data.get('markets') and len(market_data['markets']) > 0:
-        market = market_data['markets'][0]
-        token_ids = market.get('clobTokenIds', [])
-    if not token_ids or len(token_ids) < 2:
-        return None, None
-
-    token_ids = [str(id) for id in token_ids[:2]]
-
-    # POST /midpoints – this is what the working bot uses
     try:
-        url = f"{CLOB_API}/midpoints"
-        payload = [{"token_id": tid} for tid in token_ids]
-        resp = requests.post(url, json=payload, headers={"Content-Type": "application/json"}, timeout=5)
+        url = f"{ORACLE_URL}/api/price/{asset}/{interval}"
+        resp = requests.get(url, timeout=5)
         if resp.status_code == 200:
             data = resp.json()
-            up = data.get(token_ids[0])
-            down = data.get(token_ids[1])
-            if up is not None and down is not None:
-                return float(up), float(down)
+            return data.get('up'), data.get('down')
     except Exception as e:
-        print(f"POST /midpoints failed: {e}")
-
+        print(f"Oracle error: {e}")
     return None, None
 
-# ----------------------------------------------------------------------
-# Format response
-# ----------------------------------------------------------------------
-def format_market_response(market_data, market_type):
-    if not market_data:
-        return f"❌ No active {market_type} market found"
+def format_market_response(asset, interval, up, down, slug, title, end_date):
+    if up is None or down is None:
+        return f"❌ Price unavailable for {asset} {interval} at this moment"
 
-    up_price, down_price = fetch_market_price(market_data)
-    if up_price is None or down_price is None:
-        return f"❌ Could not fetch prices for {market_type}"
-
-    up_cents = up_price * 100
-    down_cents = down_price * 100
-
-    title = market_data.get('title', '')
-    if not title and market_data.get('markets'):
-        title = market_data['markets'][0].get('question', '')
-
-    end_date = market_data.get('end_date', '')
-    if not end_date and market_data.get('markets'):
-        end_date = market_data['markets'][0].get('endDate', '')
+    up_cents = up * 100
+    down_cents = down * 100
 
     try:
         if end_date:
@@ -95,16 +59,42 @@ def format_market_response(market_data, market_type):
     except:
         time_str = "Unknown time"
 
-    response = f"📈 *{title}*\n"
-    response += f"Slug: `{market_data.get('slug', 'unknown')}`\n\n"
-    response += f"UP (mid): {up_cents:.0f}¢\n"
-    response += f"DOWN (mid): {down_cents:.0f}¢\n\n"
-    response += f"Source: CLOB /midpoints (POST)"
-    return response
+    return (
+        f"📈 *{title}*\n"
+        f"Slug: `{slug}`\n"
+        f"Ends: {time_str}\n\n"
+        f"UP: {up_cents:.0f}¢\n"
+        f"DOWN: {down_cents:.0f}¢\n\n"
+        f"Source: Working bot oracle"
+    )
 
-# ----------------------------------------------------------------------
-# Command handlers (unchanged – include them all)
-# ----------------------------------------------------------------------
+async def updown_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    command = update.message.text[1:]
+    if command not in COMMAND_MAP:
+        await update.message.reply_text("❌ Unknown command")
+        return
+
+    asset, interval = COMMAND_MAP[command]
+    minutes = 5 if interval == "5m" else 15
+    timestamp = market_finder.get_current_window_timestamp(minutes)
+    slug = f"{asset}-updown-{interval}-{timestamp}"
+    event = market_finder.get_event_by_slug(slug)
+
+    if not event:
+        await update.message.reply_text(f"❌ No active {command} market")
+        return
+
+    title = event.get('title') or event.get('question') or slug
+    end_date = event.get('endDate')
+
+    up, down = fetch_price_from_oracle(asset, interval)
+    response = format_market_response(asset, interval, up, down, slug, title, end_date)
+    await update.message.reply_text(response, parse_mode='Markdown')
+
+# ========== Keep all your other command handlers here ==========
+# They are unchanged – you can copy them from your current file.
+# For completeness, I'll include them but you must ensure they are present.
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     help_text = """
 🤖 *Polymarket Bot*
@@ -152,10 +142,10 @@ async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🏓 Pong! Bot is alive")
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    btc5 = market_finder.get_market_by_slug('btc-updown-5m-' + str(market_finder.get_current_window_timestamp(5)))
-    btc15 = market_finder.get_market_by_slug('btc-updown-15m-' + str(market_finder.get_current_window_timestamp(15)))
-    eth5 = market_finder.get_market_by_slug('eth-updown-5m-' + str(market_finder.get_current_window_timestamp(5)))
-    eth15 = market_finder.get_market_by_slug('eth-updown-15m-' + str(market_finder.get_current_window_timestamp(15)))
+    btc5 = market_finder.get_event_by_slug(f"btc-updown-5m-{market_finder.get_current_window_timestamp(5)}")
+    btc15 = market_finder.get_event_by_slug(f"btc-updown-15m-{market_finder.get_current_window_timestamp(15)}")
+    eth5 = market_finder.get_event_by_slug(f"eth-updown-5m-{market_finder.get_current_window_timestamp(5)}")
+    eth15 = market_finder.get_event_by_slug(f"eth-updown-15m-{market_finder.get_current_window_timestamp(15)}")
 
     mode = "📝 PAPER" if journal.paper_mode else "🚀 LIVE"
     status_text = f"""
@@ -177,27 +167,9 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     await update.message.reply_text(status_text, parse_mode='Markdown')
 
-async def updown_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    command = update.message.text[1:]
-    if command not in COMMAND_MAP:
-        await update.message.reply_text("❌ Unknown command")
-        return
-
-    pattern = COMMAND_MAP[command]
-    minutes = 5 if '5m' in command else 15
-    timestamp = market_finder.get_current_window_timestamp(minutes)
-    slug = f"{pattern}-{timestamp}"
-    market_data = market_finder.get_market_by_slug(slug)
-
-    if market_data:
-        response = format_market_response(market_data, command)
-        await update.message.reply_text(response, parse_mode='Markdown')
-    else:
-        await update.message.reply_text(f"❌ No {command} market right now. Try again in a few minutes.")
-
 async def trending(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        url = f"{GAMMA_API}/markets"
+        url = f"https://gamma-api.polymarket.com/markets"
         params = {"order": "volume", "limit": 10, "active": "true"}
         resp = requests.get(url, params=params, timeout=10)
         if resp.status_code == 200:
@@ -213,7 +185,6 @@ async def trending(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"❌ Error: {str(e)[:50]}")
 
-# ---------- search commands ----------
 async def searchbtc(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await perform_search(update, "bitcoin")
 async def searcheth(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -223,7 +194,7 @@ async def searchcrypto(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def perform_search(update: Update, term: str):
     try:
-        url = f"{GAMMA_API}/markets"
+        url = f"https://gamma-api.polymarket.com/markets"
         params = {"title": term, "limit": 5, "active": "true"}
         resp = requests.get(url, params=params, timeout=10)
         if resp.status_code == 200:
@@ -240,7 +211,6 @@ async def perform_search(update: Update, term: str):
     except Exception as e:
         await update.message.reply_text(f"❌ Error: {str(e)[:50]}")
 
-# ---------- portfolio commands ----------
 async def pnl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     summary = journal.get_today_summary()
     stats = summary['stats']
@@ -321,13 +291,14 @@ async def threshold5000(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def threshold10000(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("✅ Whale alert threshold set to *$10,000*", parse_mode='Markdown')
 
-# ----------------------------------------------------------------------
-# Main
-# ----------------------------------------------------------------------
 def main():
     if not TOKEN:
         print("❌ TELEGRAM_TOKEN not found")
         return
+    if not ORACLE_URL:
+        print("❌ PRICE_ORACLE_URL not set in environment")
+        return
+
     app = ApplicationBuilder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
@@ -347,7 +318,8 @@ def main():
     app.add_handler(CommandHandler("threshold10000", threshold10000))
     for cmd in COMMAND_MAP:
         app.add_handler(CommandHandler(cmd, updown_handler))
-    print("🤖 Telegram bot started (REST API method).")
+
+    print("🤖 Telegram bot started (using Node.js price oracle).")
     app.run_polling()
 
 if __name__ == "__main__":
