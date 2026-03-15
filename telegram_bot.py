@@ -32,6 +32,7 @@ COMMAND_MAP = {
 
 def fetch_price_from_oracle(asset, interval):
     if not ORACLE_URL:
+        print("❌ PRICE_ORACLE_URL not set")
         return None, None
     try:
         url = f"{ORACLE_URL}/api/price/{asset}/{interval}"
@@ -78,23 +79,21 @@ async def updown_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     minutes = 5 if interval == "5m" else 15
     timestamp = market_finder.get_current_window_timestamp(minutes)
     slug = f"{asset}-updown-{interval}-{timestamp}"
-    event = market_finder.get_event_by_slug(slug)
+    # Use get_market_by_slug (correct method name)
+    market_data = market_finder.get_market_by_slug(slug)
 
-    if not event:
+    if not market_data:
         await update.message.reply_text(f"❌ No active {command} market")
         return
 
-    title = event.get('title') or event.get('question') or slug
-    end_date = event.get('endDate')
+    title = market_data.get('title') or market_data.get('question') or slug
+    end_date = market_data.get('end_date')
 
     up, down = fetch_price_from_oracle(asset, interval)
     response = format_market_response(asset, interval, up, down, slug, title, end_date)
     await update.message.reply_text(response, parse_mode='Markdown')
 
-# ========== Keep all your other command handlers here ==========
-# They are unchanged – you can copy them from your current file.
-# For completeness, I'll include them but you must ensure they are present.
-
+# ========== All other command handlers (unchanged) ==========
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     help_text = """
 🤖 *Polymarket Bot*
@@ -142,10 +141,10 @@ async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🏓 Pong! Bot is alive")
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    btc5 = market_finder.get_event_by_slug(f"btc-updown-5m-{market_finder.get_current_window_timestamp(5)}")
-    btc15 = market_finder.get_event_by_slug(f"btc-updown-15m-{market_finder.get_current_window_timestamp(15)}")
-    eth5 = market_finder.get_event_by_slug(f"eth-updown-5m-{market_finder.get_current_window_timestamp(5)}")
-    eth15 = market_finder.get_event_by_slug(f"eth-updown-15m-{market_finder.get_current_window_timestamp(15)}")
+    btc5 = market_finder.get_market_by_slug(f"btc-updown-5m-{market_finder.get_current_window_timestamp(5)}")
+    btc15 = market_finder.get_market_by_slug(f"btc-updown-15m-{market_finder.get_current_window_timestamp(15)}")
+    eth5 = market_finder.get_market_by_slug(f"eth-updown-5m-{market_finder.get_current_window_timestamp(5)}")
+    eth15 = market_finder.get_market_by_slug(f"eth-updown-15m-{market_finder.get_current_window_timestamp(15)}")
 
     mode = "📝 PAPER" if journal.paper_mode else "🚀 LIVE"
     status_text = f"""
