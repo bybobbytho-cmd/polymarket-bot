@@ -1,6 +1,6 @@
 """
 Telegram Bot for Polymarket – Uses working bot as price oracle with candidate windows
-Includes paper trading, real‑time PnL, and $1 minimum stake.
+Includes paper trading on BTC 5m & 15m, real‑time PnL, and auto‑close expired positions.
 """
 
 import os
@@ -20,7 +20,6 @@ load_dotenv()
 
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 ORACLE_URL = os.getenv("PRICE_ORACLE_URL")
-# Virtual capital for paper trading – default $10
 CAPITAL = float(os.getenv("BALANCE_USDC", "10.0"))
 
 market_finder = MinuteMarketFinder()
@@ -118,11 +117,11 @@ async def strategy(update: Update, context: ContextTypes.DEFAULT_TYPE):
     stake = max(1.0, CAPITAL * 0.02)
     msg = (
         "📊 *Current Strategy*\n\n"
-        "Simple mean‑reversion on BTC/ETH 5m/15m markets:\n"
+        "Simple mean‑reversion on **BTC 5‑minute and 15‑minute** markets:\n"
         "- Buy YES when price < 0.20 (20¢)\n"
         "- Buy NO when price > 0.80 (80¢)\n"
         f"- Stake per trade: ${stake:.2f} (minimum $1, 2% of virtual capital)\n"
-        "- Positions are held until resolution (no exit logic yet)\n\n"
+        "- Positions auto‑close after market end time (zero PnL if outcome unknown)\n\n"
         f"Virtual capital: ${CAPITAL:.2f}\n"
         "Paper mode only. Use `/togglepaper` to switch to live."
     )
@@ -184,7 +183,7 @@ async def list_trades(update: Update, context: ContextTypes.DEFAULT_TYPE):
         side = data['side'].upper()
         market = data['market']
         price = data['price']
-        stake = data['size']      # already in dollars
+        stake = data['size']
         lines.append(f"🕒 {timestamp}\n{market}\n{side} @ ${price:.3f} | stake ${stake:.2f}")
 
     msg = "📋 *Last 10 paper trades*\n\n" + "\n\n".join(lines)
@@ -228,16 +227,14 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ========== PNL COMMAND (REAL-TIME) ==========
 def parse_slug(slug):
-    """Extract asset and interval from a slug like 'btc-updown-5m-1234567890'."""
     parts = slug.split('-')
     if len(parts) >= 4:
         asset = parts[0]
-        interval = parts[2]  # "5m" or "15m"
+        interval = parts[2]
         return asset, interval
     return None, None
 
 async def pnl(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Update open positions with current prices
     total_unrealized = 0.0
     for slug, pos in list(journal.open_positions.items()):
         asset, interval = parse_slug(slug)
@@ -246,7 +243,6 @@ async def pnl(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if up is not None and down is not None:
                 current_price = up if pos.data['side'] == 'YES' else down
                 pos.data['current_price'] = current_price
-                # Compute unrealized PnL in dollars
                 if pos.data['side'] == 'YES':
                     pos.data['unrealized_pnl'] = (current_price - pos.data['entry_price']) * pos.data['size']
                 else:
@@ -259,10 +255,10 @@ async def pnl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     win_rate = (stats['winning_trades'] / total_trades * 100) if total_trades > 0 else 0
     mode = "📝 PAPER" if journal.paper_mode else "🚀 LIVE"
 
-    realized = stats['realized_pnl']   # already in dollars from journal
+    realized = stats['realized_pnl']
     unrealized = total_unrealized
     total = realized + unrealized
-    total_stakes = stats['total_volume']  # already in dollars
+    total_stakes = stats['total_volume']
 
     text = f"""
 📊 *TODAY'S PERFORMANCE* {mode}
@@ -356,7 +352,7 @@ async def history(update: Update, context: ContextTypes.DEFAULT_TYPE):
         out += f"{sign} *{d['market']}* {d['side'].upper()}\n   ${d['price']:.3f} | Stake ${stake:.2f} | PnL ${pnl:.2f}\n\n"
     await update.message.reply_text(out, parse_mode='Markdown')
 
-# ========== TRENDING, SEARCH, ETC (unchanged) ==========
+# ========== TRENDING, SEARCH, ETC ==========
 async def trending(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         url = f"https://gamma-api.polymarket.com/markets"
@@ -470,7 +466,7 @@ def main():
     for cmd in COMMAND_MAP:
         app.add_handler(CommandHandler(cmd, updown_handler))
 
-    print("🤖 Telegram bot started with paper trading job (every 60s).")
+    print("🤖 Telegram bot started with paper trading job (every 60s) on BTC 5m & 15m.")
     app.run_polling()
 
 if __name__ == "__main__":
