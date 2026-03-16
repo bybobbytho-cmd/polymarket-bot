@@ -1,5 +1,6 @@
 """
 Telegram Bot for Polymarket – Uses working bot as price oracle with candidate windows
+Includes background paper trading job.
 """
 
 import os
@@ -8,11 +9,12 @@ import json
 from datetime import datetime
 from pathlib import Path
 from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, JobQueue
 from dotenv import load_dotenv
 
 from config import MinuteMarketFinder, Config
 from journal import PolymarketJournal
+from trader import PaperTrader
 
 load_dotenv()
 
@@ -22,6 +24,7 @@ ORACLE_URL = os.getenv("PRICE_ORACLE_URL")
 market_finder = MinuteMarketFinder()
 config = Config()
 journal = PolymarketJournal(paper_mode=True)
+trader = PaperTrader(journal, market_finder, ORACLE_URL)
 
 COMMAND_MAP = {
     "updownbtc5m": ("btc", "5m"),
@@ -78,7 +81,6 @@ async def updown_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     asset, interval = COMMAND_MAP[command]
     minutes = 5 if interval == "5m" else 15
 
-    # First, get prices and the exact slug from the oracle
     up, down, oracle_data = fetch_price_from_oracle(asset, interval)
     if oracle_data is None:
         await update.message.reply_text("❌ Oracle not reachable")
@@ -89,14 +91,12 @@ async def updown_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Oracle returned no slug")
         return
 
-    # Now fetch market metadata using the exact slug from oracle
     market_data = market_finder.get_market_by_slug(slug)
     if not market_data:
-        # Fallback: try candidate windows if oracle's slug fails
         for start in market_finder.candidate_window_starts(minutes):
             alt_slug = f"{asset}-updown-{interval}-{start}"
             if alt_slug == slug:
-                continue  # already tried
+                continue
             market_data = market_finder.get_market_by_slug(alt_slug)
             if market_data:
                 slug = alt_slug
@@ -113,7 +113,6 @@ async def updown_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ========== DIAGNOSTIC COMMAND ==========
 async def testprice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Test the oracle directly – returns raw JSON"""
     if len(context.args) < 2:
         await update.message.reply_text("Usage: /testprice <asset> <interval> (e.g., /testprice btc 5m)")
         return
@@ -128,7 +127,13 @@ async def testprice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"Error: {e}")
 
-# ========== All other command handlers ==========
+# ========== TRADER CONTROL COMMANDS ==========
+async def start_trader(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Manually trigger one trader cycle (for testing)."""
+    trader.run_cycle()
+    await update.message.reply_text("Trader cycle executed. Check journal for any paper trades.")
+
+# ========== All other command handlers (unchanged) ==========
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     help_text = """
 🤖 *Polymarket Bot*
@@ -163,6 +168,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 🛠️ *DIAGNOSTIC*
 /testprice btc 5m – Raw oracle output
+
+📊 *TRADER*
+/start_trader – Run one trader cycle manually
 
 ❓ *HELP*
 /start – This message
@@ -328,6 +336,10 @@ async def threshold5000(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def threshold10000(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("✅ Whale alert threshold set to *$10,000*", parse_mode='Markdown')
 
+def run_trader_job(context: ContextTypes.DEFAULT_TYPE):
+    """Background job to run trader cycle."""
+    trader.run_cycle()
+
 def main():
     if not TOKEN:
         print("❌ TELEGRAM_TOKEN not found")
@@ -337,6 +349,11 @@ def main():
         return
 
     app = ApplicationBuilder().token(TOKEN).build()
+    job_queue = app.job_queue
+
+    # Schedule trader job every 60 seconds
+    job_queue.run_repeating(run_trader_job, interval=60, first=10)
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("ping", ping))
@@ -354,10 +371,11 @@ def main():
     app.add_handler(CommandHandler("threshold5000", threshold5000))
     app.add_handler(CommandHandler("threshold10000", threshold10000))
     app.add_handler(CommandHandler("testprice", testprice))
+    app.add_handler(CommandHandler("start_trader", start_trader))
     for cmd in COMMAND_MAP:
         app.add_handler(CommandHandler(cmd, updown_handler))
 
-    print("🤖 Telegram bot started (using Node.js price oracle).")
+    print("🤖 Telegram bot started with paper trading job (every 60s).")
     app.run_polling()
 
 if __name__ == "__main__":
