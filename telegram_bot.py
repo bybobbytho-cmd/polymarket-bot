@@ -1,6 +1,6 @@
 """
 Telegram Bot for Polymarket – Uses working bot as price oracle with candidate windows
-Includes background paper trading job and CSV export.
+Includes paper trading, trade listing, and CSV export.
 """
 
 import os
@@ -135,7 +135,8 @@ async def start_trader(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ========== EXPORT JOURNAL COMMAND ==========
 async def export_journal(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Send today's trade CSV file."""
+    """Generate today's trade CSV and send it."""
+    journal.export_to_csv()
     today = datetime.now().strftime('%Y%m%d')
     csv_file = Path("data/journal/summaries") / f"trades_{today}.csv"
     if csv_file.exists():
@@ -144,57 +145,76 @@ async def export_journal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("No trades file found for today.")
 
-# ========== All other command handlers ==========
+# ========== TRADES LIST COMMAND ==========
+async def list_trades(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show today's paper trades with details."""
+    trades_file = Path("data/journal/trades") / f"fills_{datetime.now().strftime('%Y%m%d')}.jsonl"
+    if not trades_file.exists():
+        await update.message.reply_text("📭 No trades today.")
+        return
+
+    trades = []
+    with open(trades_file, 'r') as f:
+        for line in f:
+            trades.append(json.loads(line))
+
+    if not trades:
+        await update.message.reply_text("📭 No trades today.")
+        return
+
+    # Limit to last 10 to avoid too long messages
+    recent = trades[-10:]
+    lines = []
+    for t in recent:
+        data = t['data']
+        timestamp = t['timestamp'] if 'timestamp' in t else data.get('entry_time', 'unknown')
+        # Try to get current price for unrealized PnL (if market still active)
+        # For simplicity, we'll just show entry details
+        side = data['side'].upper()
+        market = data['market']
+        price = data['price']
+        size = data['size']
+        # Format: time, market, side, price, size
+        lines.append(f"🕒 {timestamp}\n{market}\n{side} @ ${price:.3f} | size {size}")
+
+    msg = "📋 *Last 10 paper trades*\n\n" + "\n\n".join(lines)
+    await update.message.reply_text(msg, parse_mode='Markdown')
+
+# ========== SIMPLIFIED START COMMAND ==========
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    help_text = """
-🤖 *Polymarket Bot*
-
-*One Word Commands — Fast & Simple*
-
-📊 *MINUTE MARKETS*
-/updownbtc5m – BTC 5m prices
-/updownbtc15m – BTC 15m prices
-/updowneth5m – ETH 5m prices
-/updowneth15m – ETH 15m prices
-
-🔥 *MARKET INTELLIGENCE*
-/trending – Top markets by volume
-/searchbtc – Search Bitcoin markets
-/searcheth – Search Ethereum markets
-/searchcrypto – Search all crypto
-
-📈 *YOUR PORTFOLIO*
-/pnl – Today's profit/loss
-/positions – Current open positions
-/history – Last 5 trades
-/balance – Your balance
-
-⚙️ *BOT CONTROLS*
-/status – Bot health check
-/ping – Quick alive check
-/risk – Current risk limits
-/togglepaper – Switch paper/live mode
-/threshold5000 – Set whale alert to $5k
-/threshold10000 – Set whale alert to $10k
-
-🛠️ *DIAGNOSTIC*
-/testprice btc 5m – Raw oracle output
-
-📊 *TRADER*
-/start_trader – Run one trader cycle manually
-/export – Download today's trade CSV
-
-❓ *HELP*
-/start – This message
-/help – Same as /start
-
-📝 *Current Mode: PAPER*
-    """
-    await update.message.reply_text(help_text, parse_mode='Markdown')
+    help_text = (
+        "🤖 Polymarket Bot is running.\n\n"
+        "Commands:\n"
+        "/updownbtc5m – BTC 5m prices\n"
+        "/updownbtc15m – BTC 15m prices\n"
+        "/updowneth5m – ETH 5m prices\n"
+        "/updowneth15m – ETH 15m prices\n"
+        "/trending – Top markets by volume\n"
+        "/searchbtc – Search Bitcoin markets\n"
+        "/searcheth – Search Ethereum markets\n"
+        "/searchcrypto – Search all crypto\n"
+        "/pnl – Today's summary\n"
+        "/trades – List today's paper trades\n"
+        "/positions – Current open positions\n"
+        "/history – Last 5 trades\n"
+        "/balance – Your balance\n"
+        "/status – Bot health check\n"
+        "/ping – Quick alive check\n"
+        "/risk – Current risk limits\n"
+        "/togglepaper – Switch paper/live mode\n"
+        "/threshold5000 – Set whale alert to $5k\n"
+        "/threshold10000 – Set whale alert to $10k\n"
+        "/testprice btc 5m – Raw oracle output\n"
+        "/start_trader – Run one trader cycle\n"
+        "/export – Download today's trade CSV\n"
+        "/help – This message"
+    )
+    await update.message.reply_text(help_text)
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await start(update, context)
 
+# ========== All other command handlers ==========
 async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🏓 Pong! Bot is alive")
 
@@ -220,9 +240,62 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 • ETH 5m: {'✅' if eth5 else '❌'}
 • ETH 15m: {'✅' if eth15 else '❌'}
 
-*Today's PnL:* ${journal.daily_stats['realized_pnl']:.2f}
+*Today's Total Stakes:* ${journal.daily_stats['total_volume']:.2f}
     """
     await update.message.reply_text(status_text, parse_mode='Markdown')
+
+async def pnl(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    summary = journal.get_today_summary()
+    stats = summary['stats']
+    total_trades = stats['winning_trades'] + stats['losing_trades']
+    win_rate = (stats['winning_trades'] / total_trades * 100) if total_trades > 0 else 0
+    mode = "📝 PAPER" if journal.paper_mode else "🚀 LIVE"
+    text = f"""
+📊 *TODAY'S PERFORMANCE* {mode}
+
+💰 Realized PnL: ${stats['realized_pnl']:.2f} (trades closed)
+📈 Unrealized PnL: ${stats['unrealized_pnl']:.2f} (open positions)
+💵 Total PnL: ${summary['total_pnl']:.2f}
+
+📊 Trades entered: {stats['orders_filled']}
+💸 Total stakes: ${stats['total_volume']:.2f}
+🎯 Win Rate (closed): {win_rate:.1f}% ({stats['winning_trades']}W/{stats['losing_trades']}L)
+
+📌 Open Positions: {summary['open_positions']}
+
+*Note: Realized PnL is zero until trades are closed.*
+    """
+    await update.message.reply_text(text, parse_mode='Markdown')
+
+async def positions(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not journal.open_positions:
+        await update.message.reply_text("📭 *No Open Positions*", parse_mode='Markdown')
+        return
+    out = "📈 *OPEN POSITIONS*\n\n"
+    for market, pos in journal.open_positions.items():
+        d = pos.data
+        out += f"*{market}*\n   Side: {d['side'].upper()}\n   Entry: ${d['entry_price']:.3f}\n   Size: {d['size']}\n\n"
+    await update.message.reply_text(out, parse_mode='Markdown')
+
+async def history(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    trades_file = Path("data/journal/trades") / f"fills_{datetime.now().strftime('%Y%m%d')}.jsonl"
+    if not trades_file.exists():
+        await update.message.reply_text("📭 *No Trades Today*", parse_mode='Markdown')
+        return
+    trades = []
+    with open(trades_file) as f:
+        for line in f:
+            trades.append(json.loads(line))
+    if not trades:
+        await update.message.reply_text("📭 *No Trades Today*", parse_mode='Markdown')
+        return
+    out = "📋 *LAST 5 TRADES*\n\n"
+    for trade in trades[-5:]:
+        d = trade['data']
+        pnl = d.get('pnl', 0)
+        sign = "✅" if pnl > 0 else "❌" if pnl < 0 else "⚪"
+        out += f"{sign} *{d['market']}* {d['side'].upper()}\n   ${d['price']:.3f} | Size: {d['size']}\n   PnL: ${pnl:.2f}\n\n"
+    await update.message.reply_text(out, parse_mode='Markdown')
 
 async def trending(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -267,56 +340,6 @@ async def perform_search(update: Update, term: str):
             await update.message.reply_text(f"❌ Search failed for '{term}'")
     except Exception as e:
         await update.message.reply_text(f"❌ Error: {str(e)[:50]}")
-
-async def pnl(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    summary = journal.get_today_summary()
-    stats = summary['stats']
-    total = stats['winning_trades'] + stats['losing_trades']
-    wr = (stats['winning_trades'] / total * 100) if total else 0
-    mode = "📝 PAPER" if journal.paper_mode else "🚀 LIVE"
-    text = f"""
-📊 *TODAY'S PERFORMANCE* {mode}
-
-💰 Realized: ${stats['realized_pnl']:.2f}
-📈 Unrealized: ${stats['unrealized_pnl']:.2f}
-💵 Total: ${summary['total_pnl']:.2f}
-
-📊 Trades: {stats['orders_filled']}
-🎯 Win Rate: {wr:.1f}% ({stats['winning_trades']}W/{stats['losing_trades']}L)
-
-📌 Open Positions: {summary['open_positions']}
-    """
-    await update.message.reply_text(text, parse_mode='Markdown')
-
-async def positions(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not journal.open_positions:
-        await update.message.reply_text("📭 *No Open Positions*", parse_mode='Markdown')
-        return
-    out = "📈 *OPEN POSITIONS*\n\n"
-    for market, pos in journal.open_positions.items():
-        d = pos.data
-        out += f"*{market}*\n   Side: {d['side'].upper()}\n   Entry: ${d['entry_price']:.3f}\n   Size: {d['size']}\n\n"
-    await update.message.reply_text(out, parse_mode='Markdown')
-
-async def history(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    trades_file = Path("data/journal/trades") / f"fills_{datetime.now().strftime('%Y%m%d')}.jsonl"
-    if not trades_file.exists():
-        await update.message.reply_text("📭 *No Trades Today*", parse_mode='Markdown')
-        return
-    trades = []
-    with open(trades_file) as f:
-        for line in f:
-            trades.append(json.loads(line))
-    if not trades:
-        await update.message.reply_text("📭 *No Trades Today*", parse_mode='Markdown')
-        return
-    out = "📋 *LAST 5 TRADES*\n\n"
-    for trade in trades[-5:]:
-        d = trade['data']
-        pnl = d.get('pnl', 0)
-        sign = "✅" if pnl > 0 else "❌" if pnl < 0 else "⚪"
-        out += f"{sign} *{d['market']}* {d['side'].upper()}\n   ${d['price']:.3f} | Size: {d['size']}\n   PnL: ${pnl:.2f}\n\n"
-    await update.message.reply_text(out, parse_mode='Markdown')
 
 async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -386,6 +409,7 @@ def main():
     app.add_handler(CommandHandler("testprice", testprice))
     app.add_handler(CommandHandler("start_trader", start_trader))
     app.add_handler(CommandHandler("export", export_journal))
+    app.add_handler(CommandHandler("trades", list_trades))
     for cmd in COMMAND_MAP:
         app.add_handler(CommandHandler(cmd, updown_handler))
 
