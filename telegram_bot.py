@@ -1,6 +1,6 @@
 """
 Telegram Bot for Polymarket – Uses working bot as price oracle with candidate windows
-Includes background paper trading job.
+Includes background paper trading job and CSV export.
 """
 
 import os
@@ -133,6 +133,17 @@ async def start_trader(update: Update, context: ContextTypes.DEFAULT_TYPE):
     trader.run_cycle()
     await update.message.reply_text("Trader cycle executed. Check journal for any paper trades.")
 
+# ========== EXPORT JOURNAL COMMAND ==========
+async def export_journal(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Send today's trade CSV file."""
+    today = datetime.now().strftime('%Y%m%d')
+    csv_file = Path("data/journal/summaries") / f"trades_{today}.csv"
+    if csv_file.exists():
+        with open(csv_file, 'rb') as f:
+            await update.message.reply_document(f, filename=f"trades_{today}.csv", caption="Today's paper trades.")
+    else:
+        await update.message.reply_text("No trades file found for today.")
+
 # ========== All other command handlers ==========
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     help_text = """
@@ -171,6 +182,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 📊 *TRADER*
 /start_trader – Run one trader cycle manually
+/export – Download today's trade CSV
 
 ❓ *HELP*
 /start – This message
@@ -336,7 +348,8 @@ async def threshold5000(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def threshold10000(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("✅ Whale alert threshold set to *$10,000*", parse_mode='Markdown')
 
-def run_trader_job(context: ContextTypes.DEFAULT_TYPE):
+# ========== BACKGROUND TRADER JOB (async) ==========
+async def run_trader_job(context: ContextTypes.DEFAULT_TYPE):
     """Background job to run trader cycle."""
     trader.run_cycle()
 
@@ -372,6 +385,7 @@ def main():
     app.add_handler(CommandHandler("threshold10000", threshold10000))
     app.add_handler(CommandHandler("testprice", testprice))
     app.add_handler(CommandHandler("start_trader", start_trader))
+    app.add_handler(CommandHandler("export", export_journal))
     for cmd in COMMAND_MAP:
         app.add_handler(CommandHandler(cmd, updown_handler))
 
