@@ -78,20 +78,38 @@ async def updown_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     asset, interval = COMMAND_MAP[command]
     minutes = 5 if interval == "5m" else 15
 
-    # Try candidate windows (previous and current)
-    for start in market_finder.candidate_window_starts(minutes):
-        slug = f"{asset}-updown-{interval}-{start}"
-        market_data = market_finder.get_market_by_slug(slug)
+    # First, get prices and the exact slug from the oracle
+    up, down, oracle_data = fetch_price_from_oracle(asset, interval)
+    if oracle_data is None:
+        await update.message.reply_text("❌ Oracle not reachable")
+        return
 
-        if market_data:
-            title = market_data.get('title') or market_data.get('question') or slug
-            end_date = market_data.get('end_date')
-            up, down, _ = fetch_price_from_oracle(asset, interval)
-            response = format_market_response(asset, interval, up, down, slug, title, end_date)
-            await update.message.reply_text(response, parse_mode='Markdown')
-            return
+    slug = oracle_data.get('slug')
+    if not slug:
+        await update.message.reply_text("❌ Oracle returned no slug")
+        return
 
-    await update.message.reply_text(f"❌ No active {command} market found")
+    # Now fetch market metadata using the exact slug from oracle
+    market_data = market_finder.get_market_by_slug(slug)
+    if not market_data:
+        # Fallback: try candidate windows if oracle's slug fails
+        for start in market_finder.candidate_window_starts(minutes):
+            alt_slug = f"{asset}-updown-{interval}-{start}"
+            if alt_slug == slug:
+                continue  # already tried
+            market_data = market_finder.get_market_by_slug(alt_slug)
+            if market_data:
+                slug = alt_slug
+                break
+
+    if not market_data:
+        await update.message.reply_text(f"❌ Could not find market data for {slug}")
+        return
+
+    title = market_data.get('title') or market_data.get('question') or slug
+    end_date = market_data.get('end_date')
+    response = format_market_response(asset, interval, up, down, slug, title, end_date)
+    await update.message.reply_text(response, parse_mode='Markdown')
 
 # ========== DIAGNOSTIC COMMAND ==========
 async def testprice(update: Update, context: ContextTypes.DEFAULT_TYPE):
