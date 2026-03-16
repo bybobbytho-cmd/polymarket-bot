@@ -1,6 +1,6 @@
 """
 Telegram Bot for Polymarket – Uses working bot as price oracle with candidate windows
-Includes paper trading, trade listing, and CSV export.
+Includes paper trading, real‑time PnL, and $1 minimum stake.
 """
 
 import os
@@ -20,11 +20,13 @@ load_dotenv()
 
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 ORACLE_URL = os.getenv("PRICE_ORACLE_URL")
+# Virtual capital for paper trading – default $10
+CAPITAL = float(os.getenv("BALANCE_USDC", "10.0"))
 
 market_finder = MinuteMarketFinder()
 config = Config()
 journal = PolymarketJournal(paper_mode=True)
-trader = PaperTrader(journal, market_finder, ORACLE_URL)
+trader = PaperTrader(journal, market_finder, ORACLE_URL, CAPITAL)
 
 COMMAND_MAP = {
     "updownbtc5m": ("btc", "5m"),
@@ -111,6 +113,21 @@ async def updown_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     response = format_market_response(asset, interval, up, down, slug, title, end_date)
     await update.message.reply_text(response, parse_mode='Markdown')
 
+# ========== STRATEGY EXPLANATION ==========
+async def strategy(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    stake = max(1.0, CAPITAL * 0.02)
+    msg = (
+        "📊 *Current Strategy*\n\n"
+        "Simple mean‑reversion on BTC/ETH 5m/15m markets:\n"
+        "- Buy YES when price < 0.20 (20¢)\n"
+        "- Buy NO when price > 0.80 (80¢)\n"
+        f"- Stake per trade: ${stake:.2f} (minimum $1, 2% of virtual capital)\n"
+        "- Positions are held until resolution (no exit logic yet)\n\n"
+        f"Virtual capital: ${CAPITAL:.2f}\n"
+        "Paper mode only. Use `/togglepaper` to switch to live."
+    )
+    await update.message.reply_text(msg, parse_mode='Markdown')
+
 # ========== DIAGNOSTIC COMMAND ==========
 async def testprice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) < 2:
@@ -129,13 +146,11 @@ async def testprice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ========== TRADER CONTROL COMMANDS ==========
 async def start_trader(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Manually trigger one trader cycle (for testing)."""
     trader.run_cycle()
     await update.message.reply_text("Trader cycle executed. Check journal for any paper trades.")
 
 # ========== EXPORT JOURNAL COMMAND ==========
 async def export_journal(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Generate today's trade CSV and send it."""
     journal.export_to_csv()
     today = datetime.now().strftime('%Y%m%d')
     csv_file = Path("data/journal/summaries") / f"trades_{today}.csv"
@@ -147,7 +162,6 @@ async def export_journal(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ========== TRADES LIST COMMAND ==========
 async def list_trades(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show today's paper trades with details."""
     trades_file = Path("data/journal/trades") / f"fills_{datetime.now().strftime('%Y%m%d')}.jsonl"
     if not trades_file.exists():
         await update.message.reply_text("📭 No trades today.")
@@ -162,20 +176,16 @@ async def list_trades(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("📭 No trades today.")
         return
 
-    # Limit to last 10 to avoid too long messages
     recent = trades[-10:]
     lines = []
     for t in recent:
         data = t['data']
         timestamp = t['timestamp'] if 'timestamp' in t else data.get('entry_time', 'unknown')
-        # Try to get current price for unrealized PnL (if market still active)
-        # For simplicity, we'll just show entry details
         side = data['side'].upper()
         market = data['market']
         price = data['price']
-        size = data['size']
-        # Format: time, market, side, price, size
-        lines.append(f"🕒 {timestamp}\n{market}\n{side} @ ${price:.3f} | size {size}")
+        stake = data['size']      # already in dollars
+        lines.append(f"🕒 {timestamp}\n{market}\n{side} @ ${price:.3f} | stake ${stake:.2f}")
 
     msg = "📋 *Last 10 paper trades*\n\n" + "\n\n".join(lines)
     await update.message.reply_text(msg, parse_mode='Markdown')
@@ -184,6 +194,7 @@ async def list_trades(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     help_text = (
         "🤖 Polymarket Bot is running.\n\n"
+        f"Virtual capital: ${CAPITAL:.2f}\n\n"
         "Commands:\n"
         "/updownbtc5m – BTC 5m prices\n"
         "/updownbtc15m – BTC 15m prices\n"
@@ -193,11 +204,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/searchbtc – Search Bitcoin markets\n"
         "/searcheth – Search Ethereum markets\n"
         "/searchcrypto – Search all crypto\n"
-        "/pnl – Today's summary\n"
+        "/pnl – Today's performance (real-time)\n"
         "/trades – List today's paper trades\n"
         "/positions – Current open positions\n"
         "/history – Last 5 trades\n"
-        "/balance – Your balance\n"
+        "/balance – Your virtual balance\n"
         "/status – Bot health check\n"
         "/ping – Quick alive check\n"
         "/risk – Current risk limits\n"
@@ -207,6 +218,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/testprice btc 5m – Raw oracle output\n"
         "/start_trader – Run one trader cycle\n"
         "/export – Download today's trade CSV\n"
+        "/strategy – Explain current strategy\n"
         "/help – This message"
     )
     await update.message.reply_text(help_text)
@@ -214,10 +226,71 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await start(update, context)
 
-# ========== All other command handlers ==========
-async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🏓 Pong! Bot is alive")
+# ========== PNL COMMAND (REAL-TIME) ==========
+def parse_slug(slug):
+    """Extract asset and interval from a slug like 'btc-updown-5m-1234567890'."""
+    parts = slug.split('-')
+    if len(parts) >= 4:
+        asset = parts[0]
+        interval = parts[2]  # "5m" or "15m"
+        return asset, interval
+    return None, None
 
+async def pnl(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Update open positions with current prices
+    total_unrealized = 0.0
+    for slug, pos in list(journal.open_positions.items()):
+        asset, interval = parse_slug(slug)
+        if asset and interval:
+            up, down, _ = fetch_price_from_oracle(asset, interval)
+            if up is not None and down is not None:
+                current_price = up if pos.data['side'] == 'YES' else down
+                pos.data['current_price'] = current_price
+                # Compute unrealized PnL in dollars
+                if pos.data['side'] == 'YES':
+                    pos.data['unrealized_pnl'] = (current_price - pos.data['entry_price']) * pos.data['size']
+                else:
+                    pos.data['unrealized_pnl'] = (pos.data['entry_price'] - current_price) * pos.data['size']
+                total_unrealized += pos.data['unrealized_pnl']
+
+    summary = journal.get_today_summary()
+    stats = summary['stats']
+    total_trades = stats['winning_trades'] + stats['losing_trades']
+    win_rate = (stats['winning_trades'] / total_trades * 100) if total_trades > 0 else 0
+    mode = "📝 PAPER" if journal.paper_mode else "🚀 LIVE"
+
+    realized = stats['realized_pnl']   # already in dollars from journal
+    unrealized = total_unrealized
+    total = realized + unrealized
+    total_stakes = stats['total_volume']  # already in dollars
+
+    text = f"""
+📊 *TODAY'S PERFORMANCE* {mode}
+Virtual Capital: ${CAPITAL:.2f}
+
+💰 Realized PnL: ${realized:.2f} (trades closed)
+📈 Unrealized PnL: ${unrealized:.2f} (open positions)
+💵 Total PnL: ${total:.2f}
+
+📊 Trades entered: {stats['orders_filled']}
+💸 Total stakes: ${total_stakes:.2f}
+🎯 Win Rate (closed): {win_rate:.1f}% ({stats['winning_trades']}W/{stats['losing_trades']}L)
+
+📌 Open Positions: {summary['open_positions']}
+
+*Note: Unrealized PnL updated in real-time from oracle.*
+    """
+    await update.message.reply_text(text, parse_mode='Markdown')
+
+# ========== BALANCE COMMAND ==========
+async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        f"💰 *VIRTUAL BALANCE*\n\nCurrent capital: ${CAPITAL:.2f}\n"
+        "Set `BALANCE_USDC` in Railway variables to change.",
+        parse_mode='Markdown'
+    )
+
+# ========== STATUS COMMAND ==========
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     btc5 = market_finder.get_market_by_slug(f"btc-updown-5m-{market_finder.get_current_window_timestamp(5)}")
     btc15 = market_finder.get_market_by_slug(f"btc-updown-15m-{market_finder.get_current_window_timestamp(15)}")
@@ -233,6 +306,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 ✅ Journal: Active
 
 *Mode:* {mode}
+*Virtual Capital:* ${CAPITAL:.2f}
 
 *Minute Markets:*
 • BTC 5m: {'✅' if btc5 else '❌'}
@@ -244,29 +318,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     await update.message.reply_text(status_text, parse_mode='Markdown')
 
-async def pnl(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    summary = journal.get_today_summary()
-    stats = summary['stats']
-    total_trades = stats['winning_trades'] + stats['losing_trades']
-    win_rate = (stats['winning_trades'] / total_trades * 100) if total_trades > 0 else 0
-    mode = "📝 PAPER" if journal.paper_mode else "🚀 LIVE"
-    text = f"""
-📊 *TODAY'S PERFORMANCE* {mode}
-
-💰 Realized PnL: ${stats['realized_pnl']:.2f} (trades closed)
-📈 Unrealized PnL: ${stats['unrealized_pnl']:.2f} (open positions)
-💵 Total PnL: ${summary['total_pnl']:.2f}
-
-📊 Trades entered: {stats['orders_filled']}
-💸 Total stakes: ${stats['total_volume']:.2f}
-🎯 Win Rate (closed): {win_rate:.1f}% ({stats['winning_trades']}W/{stats['losing_trades']}L)
-
-📌 Open Positions: {summary['open_positions']}
-
-*Note: Realized PnL is zero until trades are closed.*
-    """
-    await update.message.reply_text(text, parse_mode='Markdown')
-
+# ========== POSITIONS COMMAND ==========
 async def positions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not journal.open_positions:
         await update.message.reply_text("📭 *No Open Positions*", parse_mode='Markdown')
@@ -274,9 +326,15 @@ async def positions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     out = "📈 *OPEN POSITIONS*\n\n"
     for market, pos in journal.open_positions.items():
         d = pos.data
-        out += f"*{market}*\n   Side: {d['side'].upper()}\n   Entry: ${d['entry_price']:.3f}\n   Size: {d['size']}\n\n"
+        current = d.get('current_price', 'N/A')
+        if isinstance(current, float):
+            current_str = f"${current:.3f}"
+        else:
+            current_str = current
+        out += f"*{market}*\n   Side: {d['side'].upper()}\n   Entry: ${d['entry_price']:.3f}\n   Stake: ${d['size']:.2f}\n   Current: {current_str}\n\n"
     await update.message.reply_text(out, parse_mode='Markdown')
 
+# ========== HISTORY COMMAND ==========
 async def history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     trades_file = Path("data/journal/trades") / f"fills_{datetime.now().strftime('%Y%m%d')}.jsonl"
     if not trades_file.exists():
@@ -292,11 +350,13 @@ async def history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     out = "📋 *LAST 5 TRADES*\n\n"
     for trade in trades[-5:]:
         d = trade['data']
-        pnl = d.get('pnl', 0)
+        stake = d['size']
+        pnl = d.get('pnl', 0.0)
         sign = "✅" if pnl > 0 else "❌" if pnl < 0 else "⚪"
-        out += f"{sign} *{d['market']}* {d['side'].upper()}\n   ${d['price']:.3f} | Size: {d['size']}\n   PnL: ${pnl:.2f}\n\n"
+        out += f"{sign} *{d['market']}* {d['side'].upper()}\n   ${d['price']:.3f} | Stake ${stake:.2f} | PnL ${pnl:.2f}\n\n"
     await update.message.reply_text(out, parse_mode='Markdown')
 
+# ========== TRENDING, SEARCH, ETC (unchanged) ==========
 async def trending(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         url = f"https://gamma-api.polymarket.com/markets"
@@ -341,11 +401,8 @@ async def perform_search(update: Update, term: str):
     except Exception as e:
         await update.message.reply_text(f"❌ Error: {str(e)[:50]}")
 
-async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "💰 *BALANCE*\n\nManual entry. Add `BALANCE_USDC=100.00` to Railway variables.",
-        parse_mode='Markdown'
-    )
+async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🏓 Pong! Bot is alive")
 
 async def risk(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = f"""
@@ -354,7 +411,7 @@ async def risk(update: Update, context: ContextTypes.DEFAULT_TYPE):
 📉 Daily Loss Limit: {config.daily_loss_limit_percent*100}%
 📊 Max Drawdown: 40%
 💰 Minimum Stake: ${config.min_stake_usd}
-📐 Position Size: Quarter Kelly (1-6%)
+📐 Position Size: max($1, 2% of capital)
 
 📌 *Today's Loss:* ${journal.daily_stats['realized_pnl']:.2f}
     """
@@ -371,9 +428,8 @@ async def threshold5000(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def threshold10000(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("✅ Whale alert threshold set to *$10,000*", parse_mode='Markdown')
 
-# ========== BACKGROUND TRADER JOB (async) ==========
+# ========== BACKGROUND TRADER JOB ==========
 async def run_trader_job(context: ContextTypes.DEFAULT_TYPE):
-    """Background job to run trader cycle."""
     trader.run_cycle()
 
 def main():
@@ -392,6 +448,7 @@ def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("strategy", strategy))
     app.add_handler(CommandHandler("ping", ping))
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("trending", trending))
