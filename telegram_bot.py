@@ -32,6 +32,7 @@ COMMAND_MAP = {
 
 def fetch_price_from_oracle(asset, interval):
     if not ORACLE_URL:
+        print("❌ PRICE_ORACLE_URL not set")
         return None, None, None
     try:
         url = f"{ORACLE_URL}/api/price/{asset}/{interval}"
@@ -86,8 +87,6 @@ async def updown_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             title = market_data.get('title') or market_data.get('question') or slug
             end_date = market_data.get('end_date')
             up, down, _ = fetch_price_from_oracle(asset, interval)
-            # If oracle returns null, we could try the next window, but we'll still respond with the found market.
-            # The oracle might return null even if market exists, so we break and return whatever oracle gives.
             response = format_market_response(asset, interval, up, down, slug, title, end_date)
             await update.message.reply_text(response, parse_mode='Markdown')
             return
@@ -97,7 +96,7 @@ async def updown_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ========== DIAGNOSTIC COMMAND ==========
 async def testprice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Test the oracle directly – returns raw JSON"""
-    if not context.args:
+    if len(context.args) < 2:
         await update.message.reply_text("Usage: /testprice <asset> <interval> (e.g., /testprice btc 5m)")
         return
     try:
@@ -111,7 +110,7 @@ async def testprice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"Error: {e}")
 
-# ========== All other command handlers (unchanged) ==========
+# ========== All other command handlers ==========
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     help_text = """
 🤖 *Polymarket Bot*
@@ -336,11 +335,11 @@ def main():
     app.add_handler(CommandHandler("togglepaper", togglepaper))
     app.add_handler(CommandHandler("threshold5000", threshold5000))
     app.add_handler(CommandHandler("threshold10000", threshold10000))
-    app.add_handler(CommandHandler("testprice", testprice))  # new diagnostic command
+    app.add_handler(CommandHandler("testprice", testprice))
     for cmd in COMMAND_MAP:
         app.add_handler(CommandHandler(cmd, updown_handler))
 
-    print("🤖 Telegram bot started (using Node.js price oracle with candidate windows).")
+    print("🤖 Telegram bot started (using Node.js price oracle).")
     app.run_polling()
 
 if __name__ == "__main__":
