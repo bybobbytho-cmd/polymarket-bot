@@ -1,41 +1,53 @@
 """
-Telegram Bot for Polymarket – Webhook version with minimal handlers for testing.
+Telegram Bot for Polymarket – Debug version with logging and echo.
 """
 
 import os
-import requests
-import json
-from datetime import datetime
-from pathlib import Path
+import logging
 from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, JobQueue
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 from dotenv import load_dotenv
 
 load_dotenv()
 
+# Set up logging to see errors in Railway logs
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
 TOKEN = os.getenv("TELEGRAM_TOKEN")
-ORACLE_URL = os.getenv("PRICE_ORACLE_URL")  # optional
+if not TOKEN:
+    logger.error("TELEGRAM_TOKEN not set!")
 
-# Simple handlers for testing
+# Simple handlers
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🤖 Bot is alive and working via webhook!")
+    logger.info(f"Received /start from user {update.effective_user.id}")
+    await update.message.reply_text("🤖 Bot is alive! Try /echo hello")
 
-async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🏓 Pong!")
+async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.info(f"Received /echo with args: {context.args}")
+    if context.args:
+        text = ' '.join(context.args)
+        await update.message.reply_text(f"You said: {text}")
+    else:
+        await update.message.reply_text("Usage: /echo <message>")
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Commands:\n/start\n/ping\n/help")
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Log errors caused by updates."""
+    logger.error(f"Update {update} caused error {context.error}")
 
 # Build application function (used by webhook.py)
 async def build_application():
     app = ApplicationBuilder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("ping", ping))
-    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("echo", echo))
+    app.add_error_handler(error_handler)
     await app.initialize()
     await app.start()
     return app
 
-# For local testing (if you ever run directly)
+# If run directly (for testing)
 if __name__ == "__main__":
-    print("This bot is designed to run via webhook.py on Railway.")
+    print("Run via webhook.py on Railway.")

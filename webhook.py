@@ -51,7 +51,6 @@ async def webhook(request: Request):
     await bot_app.process_update(update)
     return "ok"
 
-# Simple GET endpoint to check if the server is alive
 @app.get("/")
 async def root():
     return {"status": "alive", "message": "Bot webhook server is running"}
