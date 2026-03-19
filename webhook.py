@@ -8,16 +8,16 @@ from telegram.ext import Application
 import os
 import uvicorn
 
+# Import the function that builds your bot application
+from telegram_bot import build_application
+
 app = FastAPI()
 BOT_TOKEN = os.getenv("TELEGRAM_TOKEN")
-
-# We'll set bot_app in startup
 bot_app = None
 
 @app.on_event("startup")
 async def startup_event():
     global bot_app
-    from telegram_bot import build_application  # import from main bot file
     bot_app = await build_application()
     webhook_url = f"https://{os.getenv('RAILWAY_PUBLIC_DOMAIN')}/webhook"
     await bot_app.bot.set_webhook(webhook_url)

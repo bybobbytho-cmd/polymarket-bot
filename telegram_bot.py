@@ -1,6 +1,6 @@
 """
 Telegram Bot for Polymarket – with 15‑min summaries and kill switch.
-Based on your working version, with added features.
+Modified to support webhooks.
 """
 
 import os
@@ -172,7 +172,6 @@ async def strategy(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(msg, parse_mode='Markdown')
 
-# -------------------- New: Pause/Resume Commands --------------------
 async def pause(update: Update, context: ContextTypes.DEFAULT_TYPE):
     trader.paused = True
     await update.message.reply_text("⏸️ Bot paused. No new trades will be entered.")
@@ -272,9 +271,8 @@ async def history(update: Update, context: ContextTypes.DEFAULT_TYPE):
         out += f"{sign} *{d['market']}* {d['side'].upper()}\n   ${d['price']:.3f} | Stake ${stake:.2f} | PnL ${pnl:.2f}\n\n"
     await update.message.reply_text(out, parse_mode='Markdown')
 
-# -------------------- Background Jobs (New) --------------------
+# -------------------- Background Jobs --------------------
 async def send_periodic_report(context: ContextTypes.DEFAULT_TYPE):
-    """Send a summary every 15 minutes."""
     chat_id = context.job.chat_id
     summary = journal.get_today_summary()
     stats = summary.get('stats', {})
@@ -297,10 +295,8 @@ Consecutive losses: {trader.consecutive_losses}
     await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode='Markdown')
 
 async def trader_job(context: ContextTypes.DEFAULT_TYPE):
-    """Run one trader cycle and check for auto‑pause."""
     trader.run_cycle()
     if trader.paused and context.job.chat_id:
-        # Determine why paused
         if trader.consecutive_losses >= 3:
             alert = f"⏸️ Bot paused due to {trader.consecutive_losses} consecutive losses."
         elif journal.daily_stats['realized_pnl'] <= -trader.DAILY_LOSS_LIMIT:
@@ -310,37 +306,25 @@ async def trader_job(context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(chat_id=context.job.chat_id, text=alert)
 
 async def start_with_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Start command that also schedules periodic jobs."""
     chat_id = update.effective_chat.id
-    # Remove any existing jobs for this chat
     current_jobs = context.application.job_queue.jobs()
     for job in current_jobs:
         if job.name == f"report_{chat_id}" or job.name == f"trader_{chat_id}":
             job.schedule_removal()
-    # Schedule periodic report every 15 minutes
     context.application.job_queue.run_repeating(
         send_periodic_report, interval=900, first=60,
         chat_id=chat_id, name=f"report_{chat_id}"
     )
-    # Schedule trader job every 60 seconds
     context.application.job_queue.run_repeating(
         trader_job, interval=60, first=10,
         chat_id=chat_id, name=f"trader_{chat_id}"
     )
     await start(update, context)
 
-# -------------------- Main --------------------
-def main():
-    if not TOKEN:
-        print("❌ TELEGRAM_TOKEN not found")
-        return
-    if not ORACLE_URL:
-        print("❌ PRICE_ORACLE_URL not set in environment")
-        return
-
+# -------------------- Build Application Function (NEW) --------------------
+async def build_application():
+    """Build and return the Application without running it."""
     app = ApplicationBuilder().token(TOKEN).build()
-
-    # Register handlers
     app.add_handler(CommandHandler("start", start_with_report))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("strategy", strategy))
@@ -358,9 +342,15 @@ def main():
     app.add_handler(CommandHandler("trades", list_trades))
     for cmd, (asset, interval) in COMMAND_MAP.items():
         app.add_handler(CommandHandler(cmd, updown_handler))
+    await app.initialize()
+    await app.start()
+    return app
 
-    print("🤖 Telegram bot started with paper trading job (every 60s) on BTC 5m & 15m.")
-    app.run_polling()
-
+# -------------------- Main (for local testing only) --------------------
 if __name__ == "__main__":
-    main()
+    print("This bot is designed to run via webhook.py on Railway.")
+    print("For local testing, you can run with polling by uncommenting the code below.")
+    # To run locally with polling, uncomment the following lines:
+    # app = ApplicationBuilder().token(TOKEN).build()
+    # ... add handlers ...
+    # app.run_polling()
