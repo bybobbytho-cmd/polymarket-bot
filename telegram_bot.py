@@ -1,7 +1,6 @@
-# Final version with 15‑min summaries and kill switch
 """
-Telegram Bot for Polymarket – with pause/resume, periodic reports, and kill switch.
-Fixed chat_id and KeyError issues.
+Telegram Bot for Polymarket – Webhook version with pause/resume, periodic reports, and kill switch.
+All handlers are included here, and a build_application() function is provided for webhook.py.
 """
 
 import os
@@ -35,6 +34,9 @@ COMMAND_MAP = {
     "updowneth15m": ("eth", "15m"),
 }
 
+# ----------------------------------------------------------------------
+# Price fetching and formatting (same as before)
+# ----------------------------------------------------------------------
 def fetch_price_from_oracle(asset, interval):
     if not ORACLE_URL:
         return None, None, None
@@ -70,6 +72,9 @@ def format_market_response(asset, interval, up, down, slug, title, end_date):
         f"Source: Working bot oracle"
     )
 
+# ----------------------------------------------------------------------
+# Command handlers (all unchanged)
+# ----------------------------------------------------------------------
 async def updown_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     command = update.message.text[1:]
     if command not in COMMAND_MAP:
@@ -177,7 +182,7 @@ async def pause(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
     trader.paused = False
-    trader.consecutive_losses = 0  # reset when resuming
+    trader.consecutive_losses = 0
     await update.message.reply_text("▶️ Bot resumed. New trades may be entered.")
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -186,7 +191,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     total_trades = stats.get('winning_trades', 0) + stats.get('losing_trades', 0)
     win_rate = (stats.get('winning_trades', 0) / total_trades * 100) if total_trades > 0 else 0
     realized = stats.get('realized_pnl', 0.0)
-    unrealized = summary.get('unrealized_pnl', 0.0)  # safe default
+    unrealized = summary.get('unrealized_pnl', 0.0)
     total = realized + unrealized
     drawdown = (1 - trader.capital / trader.peak_capital) * 100 if trader.peak_capital > 0 else 0
     msg = f"""
@@ -274,9 +279,10 @@ async def history(update: Update, context: ContextTypes.DEFAULT_TYPE):
         out += f"{sign} *{d['market']}* {d['side'].upper()}\n   ${d['price']:.3f} | Stake ${stake:.2f} | PnL ${pnl:.2f}\n\n"
     await update.message.reply_text(out, parse_mode='Markdown')
 
-# ---------- Background jobs ----------
+# ----------------------------------------------------------------------
+# Background jobs (periodic report and trader)
+# ----------------------------------------------------------------------
 async def send_periodic_report(context: ContextTypes.DEFAULT_TYPE):
-    """Send a summary every 15 minutes."""
     chat_id = context.job.chat_id
     summary = journal.get_today_summary()
     stats = summary.get('stats', {})
@@ -299,52 +305,38 @@ Consecutive losses: {trader.consecutive_losses}
     await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode='Markdown')
 
 async def trader_job(context: ContextTypes.DEFAULT_TYPE):
-    """Run one trader cycle and check for critical alerts."""
     trader.run_cycle()
-    # Check if auto‑paused and send alert
     if trader.paused:
-        # Determine why paused
         if trader.consecutive_losses >= 3:
             alert = f"⏸️ Bot paused due to {trader.consecutive_losses} consecutive losses."
         elif journal.daily_stats['realized_pnl'] <= -trader.DAILY_LOSS_LIMIT:
             alert = f"⏸️ Bot paused because daily loss limit (${trader.DAILY_LOSS_LIMIT:.2f}) was reached."
         else:
             alert = "⏸️ Bot paused (manual or other reason)."
-        # Only send if we have a chat_id
         if context.job.chat_id:
             await context.bot.send_message(chat_id=context.job.chat_id, text=alert)
 
 async def start_with_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Start command that also schedules periodic jobs."""
     chat_id = update.effective_chat.id
-    # Remove any existing jobs for this chat
     current_jobs = context.application.job_queue.jobs()
     for job in current_jobs:
         if job.name == f"report_{chat_id}" or job.name == f"trader_{chat_id}":
             job.schedule_removal()
-    # Schedule periodic report every 15 minutes
     context.application.job_queue.run_repeating(
-        send_periodic_report, interval=900, first=60, 
+        send_periodic_report, interval=900, first=60,
         chat_id=chat_id, name=f"report_{chat_id}"
     )
-    # Schedule trader job every 60 seconds
     context.application.job_queue.run_repeating(
-        trader_job, interval=60, first=10, 
+        trader_job, interval=60, first=10,
         chat_id=chat_id, name=f"trader_{chat_id}"
     )
     await start(update, context)
 
-def main():
-    if not TOKEN:
-        print("❌ TELEGRAM_TOKEN not found")
-        return
-    if not ORACLE_URL:
-        print("❌ PRICE_ORACLE_URL not set in environment")
-        return
-
+# ----------------------------------------------------------------------
+# Function to build the application (used by webhook.py)
+# ----------------------------------------------------------------------
+async def build_application():
     app = ApplicationBuilder().token(TOKEN).build()
-
-    # Register handlers
     app.add_handler(CommandHandler("start", start_with_report))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("strategy", strategy))
@@ -366,9 +358,14 @@ def main():
     app.add_handler(CommandHandler("trades", list_trades))
     for cmd, (asset, interval) in COMMAND_MAP.items():
         app.add_handler(CommandHandler(cmd, updown_handler))
+    await app.initialize()
+    await app.start()
+    return app
 
-    print("🤖 Telegram bot started with pause/resume and periodic reports.")
-    app.run_polling()
-
+# ----------------------------------------------------------------------
+# For direct execution (though we'll use webhook.py)
+# ----------------------------------------------------------------------
 if __name__ == "__main__":
-    main()
+    # This part is not used when running via webhook.py
+    print("This bot is designed to run via webhook.py with FastAPI.")
+    print("Please run 'python webhook.py' instead.")
