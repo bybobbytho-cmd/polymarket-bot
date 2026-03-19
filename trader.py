@@ -66,49 +66,51 @@ class PaperTrader:
     def close_expired_positions(self):
         """
         Check all open positions; if the market end time has passed,
-        determine the outcome and close the position.
+        close the position (assume loss for now).
         """
         now = datetime.now(timezone.utc)
-        for slug, pos_data in list(self.journal.open_positions.items()):
-            # Get market end date from the position data
-            end_date_str = pos_data.data.get('end_date')
-            if not end_date_str:
-                # Try to fetch market data again to get end date
+        print(f"Checking for expired positions at {now.isoformat()}")
+
+        # Make a copy of the keys because we might modify the dict while iterating
+        slugs = list(self.journal.open_positions.keys())
+        for slug in slugs:
+            pos_data = self.journal.open_positions.get(slug)
+            if not pos_data:
+                continue
+
+            # Parse the timestamp from the slug
+            # slug format: btc-updown-5m-1773915600
+            try:
                 parts = slug.split('-')
-                if len(parts) >= 4:
-                    asset = parts[0]
-                    interval = parts[2]
-                    # We don't have a direct way to get end date from oracle, so skip
+                if len(parts) < 4:
                     continue
+                timestamp_str = parts[3]
+                start_time = datetime.fromtimestamp(int(timestamp_str), tz=timezone.utc)
+
+                # Determine duration based on interval
+                interval = parts[2]  # '5m' or '15m'
+                if interval == '5m':
+                    duration = timedelta(minutes=5)
+                elif interval == '15m':
+                    duration = timedelta(minutes=15)
                 else:
                     continue
 
-            try:
-                end_dt = datetime.fromisoformat(end_date_str.replace('Z', '+00:00'))
-                if now > end_dt:
-                    # Market expired – we need to resolve the trade
+                end_time = start_time + duration
+
+                if now > end_time:
+                    # Market expired – close position as a loss
                     side = pos_data.data['side'].upper()
                     entry_price = pos_data.data['entry_price']
                     size = pos_data.data['size']
-                    
-                    # Determine final price based on direction
-                    # Since we can't know the actual outcome without the final price,
-                    # we'll assume the trade lost if we don't have a better method.
-                    # A more accurate approach would be to fetch the final market price,
-                    # but that's complex. For now, we'll use a simple rule:
-                    # If you bought YES at <0.50 and the price went up, you win; otherwise lose.
-                    # But we don't have the final price. Let's use the oracle's last price? Not reliable.
-                    
-                    # For demonstration, we'll set final price to 0.0 (loss)
-                    # You can improve this later by storing resolution prices.
-                    final_price = 0.0
-                    
+                    final_price = 0.0  # assume loss
+
                     # Compute PnL
                     if side == 'YES':
                         pnl = (final_price - entry_price) * size
                     else:
                         pnl = (entry_price - final_price) * size
-                    
+
                     # Record exit
                     order_id = f"expired_{int(time.time())}"
                     self.journal.record_order(
@@ -142,12 +144,6 @@ class PaperTrader:
                 if signal['slug'] in self.journal.open_positions:
                     continue
 
-                # Fetch market end date from market_finder
-                market_data = self.market_finder.get_market_by_slug(signal['slug'])
-                if not market_data:
-                    continue
-                end_date = market_data.get('end_date')
-
                 self.journal.record_signal(
                     market=signal['slug'],
                     price=signal['price'],
@@ -170,6 +166,4 @@ class PaperTrader:
                     order_id=order_id,
                     fee=0.0
                 )
-                # Store end date in the position data (the journal already has it in the fill entry)
-                # We'll retrieve it later via market_finder if needed.
                 print(f"Paper trade executed: {signal['slug']} {signal['side']} @ ${signal['price']:.3f} for ${signal['stake']:.2f}")
