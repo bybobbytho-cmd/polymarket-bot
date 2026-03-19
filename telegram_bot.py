@@ -1,3 +1,4 @@
+# Final version with 15‑min summaries and kill switch
 """
 Telegram Bot for Polymarket – with pause/resume, periodic reports, and kill switch.
 Fixed chat_id and KeyError issues.
