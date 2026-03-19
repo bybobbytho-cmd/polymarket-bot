@@ -1,6 +1,5 @@
 """
-Paper trading module for Polymarket bot
-Runs strategies on BTC 5m and 15m markets, with take‑profit and stop‑loss.
+Paper trading module with pause on consecutive losses and daily loss limit.
 """
 
 import time
@@ -13,8 +12,10 @@ from journal import PolymarketJournal
 
 # ==================== CONFIGURABLE PARAMETERS ====================
 ENTRY_THRESHOLD = 0.20      # Buy YES when price < this; buy NO when price > (1 - ENTRY_THRESHOLD)
-TAKE_PROFIT_PCT = 0.10      # Sell if profit >= 10% (e.g., 0.20 → 0.22)
-STOP_LOSS_PCT = 0.30        # Sell if loss >= 30% (e.g., 0.20 → 0.14)
+TAKE_PROFIT_PCT = 0.10      # Sell if profit >= 10%
+STOP_LOSS_PCT = 0.30        # Sell if loss >= 30%
+CONSECUTIVE_LOSS_LIMIT = 3  # Pause after this many losses in a row
+DAILY_LOSS_LIMIT = 0.50     # Pause if realized loss for the day exceeds $0.50
 # ================================================================
 
 class PaperTrader:
@@ -23,10 +24,12 @@ class PaperTrader:
         self.market_finder = market_finder
         self.oracle_url = oracle_url
         self.capital = capital
-        self.positions = {}  # slug -> {side, entry_price, size, interval}
+        self.positions = {}          # slug -> position dict
+        self.consecutive_losses = 0
+        self.paused = False
+        self.peak_capital = capital
 
     def fetch_price(self, asset: str, interval: str):
-        """Get current price and slug from oracle."""
         try:
             url = f"{self.oracle_url}/api/price/{asset}/{interval}"
             resp = requests.get(url, timeout=5)
@@ -38,15 +41,12 @@ class PaperTrader:
         return None, None, None
 
     def evaluate_strategy(self, asset: str, interval: str) -> Optional[Dict]:
-        """Trades BTC only (both 5m and 15m). Uses ENTRY_THRESHOLD."""
-        if asset != 'btc':
+        if asset != 'btc' or self.paused:
             return None
         up, down, slug = self.fetch_price(asset, interval)
         if up is None or down is None:
             return None
-
         stake = max(1.0, self.capital * 0.02)  # $1 minimum
-
         if up < ENTRY_THRESHOLD:
             return {
                 'side': 'YES',
@@ -70,11 +70,9 @@ class PaperTrader:
         return None
 
     def check_exit_conditions(self):
-        """Check open positions for take‑profit or stop‑loss."""
         slugs_to_remove = []
         for slug, pos in self.positions.items():
-            # Get current price
-            asset = 'btc'  # we only trade BTC
+            asset = 'btc'
             interval = pos['interval']
             up, down, _ = self.fetch_price(asset, interval)
             if up is None or down is None:
@@ -82,25 +80,20 @@ class PaperTrader:
             current_price = up if pos['side'] == 'YES' else down
             entry_price = pos['entry_price']
             size = pos['size']
-
-            # Compute profit percentage
             if pos['side'] == 'YES':
                 profit_pct = (current_price - entry_price) / entry_price
             else:
                 profit_pct = (entry_price - current_price) / entry_price
 
-            # Take profit
             if profit_pct >= TAKE_PROFIT_PCT:
                 final_price = current_price
                 print(f"Take profit on {slug} at {final_price:.3f} (entry {entry_price:.3f})")
-            # Stop loss
             elif profit_pct <= -STOP_LOSS_PCT:
                 final_price = current_price
                 print(f"Stop loss on {slug} at {final_price:.3f} (entry {entry_price:.3f})")
             else:
                 continue
 
-            # Close the position
             if pos['side'] == 'YES':
                 pnl = (final_price - entry_price) * size
             else:
@@ -124,11 +117,21 @@ class PaperTrader:
             )
             slugs_to_remove.append(slug)
 
+            # Update consecutive losses
+            if pnl < 0:
+                self.consecutive_losses += 1
+            else:
+                self.consecutive_losses = 0
+
+            # Update capital
+            self.capital += pnl
+            if self.capital > self.peak_capital:
+                self.peak_capital = self.capital
+
         for slug in slugs_to_remove:
             del self.positions[slug]
 
     def close_expired_positions(self):
-        """Close positions whose market end time has passed."""
         now = datetime.now(timezone.utc)
         slugs_to_remove = []
         for slug, pos in self.positions.items():
@@ -147,16 +150,14 @@ class PaperTrader:
                     continue
                 end_time = start_time + duration
                 if now > end_time:
-                    # Market expired – assume loss (0.0)
                     entry_price = pos['entry_price']
                     size = pos['size']
                     side = pos['side']
-                    final_price = 0.0
+                    final_price = 0.0  # assume loss
                     if side == 'YES':
                         pnl = (final_price - entry_price) * size
                     else:
                         pnl = (entry_price - final_price) * size
-
                     order_id = f"expired_{int(time.time())}"
                     self.journal.record_order(
                         market=slug,
@@ -175,27 +176,43 @@ class PaperTrader:
                     )
                     print(f"Closed expired position {slug} with PnL ${pnl:.2f}")
                     slugs_to_remove.append(slug)
+
+                    # Update consecutive losses and capital
+                    if pnl < 0:
+                        self.consecutive_losses += 1
+                    else:
+                        self.consecutive_losses = 0
+                    self.capital += pnl
+                    if self.capital > self.peak_capital:
+                        self.peak_capital = self.capital
             except Exception as e:
-                print(f"Error closing expired position {slug}: {e}")
+                print(f"Error closing expired {slug}: {e}")
 
         for slug in slugs_to_remove:
             del self.positions[slug]
 
     def run_cycle(self):
-        """Check for exits, close expired, then enter new trades."""
-        # First check exit conditions (take profit / stop loss)
+        """Main cycle: check exits, expired, then enter new trades if not paused."""
         self.check_exit_conditions()
-
-        # Then close any expired positions
         self.close_expired_positions()
 
-        # Finally enter new trades
+        # Auto‑pause if daily loss limit exceeded
+        daily_realized = self.journal.daily_stats['realized_pnl']
+        if daily_realized <= -DAILY_LOSS_LIMIT:
+            self.paused = True
+            print(f"Daily loss limit reached (${daily_realized:.2f}). Bot paused.")
+
+        # Auto‑pause if consecutive losses limit reached
+        if self.consecutive_losses >= CONSECUTIVE_LOSS_LIMIT:
+            self.paused = True
+            print(f"Consecutive losses ({self.consecutive_losses}) reached. Bot paused.")
+
+        if self.paused:
+            return  # don't enter new trades
+
         for interval in ['5m', '15m']:
             signal = self.evaluate_strategy('btc', interval)
-            if signal:
-                if signal['slug'] in self.positions:
-                    continue
-
+            if signal and signal['slug'] not in self.positions:
                 self.journal.record_signal(
                     market=signal['slug'],
                     price=signal['price'],
