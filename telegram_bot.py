@@ -1,5 +1,6 @@
 """
 Telegram Bot for Polymarket – with pause/resume, periodic reports, and kill switch.
+Fixed chat_id and KeyError issues.
 """
 
 import os
@@ -156,7 +157,6 @@ async def list_trades(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg, parse_mode='Markdown')
 
 async def strategy(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    stake = max(1.0, CAPITAL * 0.02)
     msg = (
         "📊 *Current Strategy*\n\n"
         "Simple mean‑reversion on BTC 5m & 15m:\n"
@@ -181,11 +181,11 @@ async def resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     summary = journal.get_today_summary()
-    stats = summary['stats']
-    total_trades = stats['winning_trades'] + stats['losing_trades']
-    win_rate = (stats['winning_trades'] / total_trades * 100) if total_trades > 0 else 0
-    realized = stats['realized_pnl']
-    unrealized = summary['unrealized_pnl']
+    stats = summary.get('stats', {})
+    total_trades = stats.get('winning_trades', 0) + stats.get('losing_trades', 0)
+    win_rate = (stats.get('winning_trades', 0) / total_trades * 100) if total_trades > 0 else 0
+    realized = stats.get('realized_pnl', 0.0)
+    unrealized = summary.get('unrealized_pnl', 0.0)  # safe default
     total = realized + unrealized
     drawdown = (1 - trader.capital / trader.peak_capital) * 100 if trader.peak_capital > 0 else 0
     msg = f"""
@@ -199,8 +199,8 @@ Status: {'⏸️ PAUSED' if trader.paused else '▶️ ACTIVE'}
 Realized PnL: ${realized:.2f}
 Unrealized PnL: ${unrealized:.2f}
 Total PnL: ${total:.2f}
-Trades: {stats['orders_filled']}
-Win rate: {win_rate:.1f}% ({stats['winning_trades']}W/{stats['losing_trades']}L)
+Trades: {stats.get('orders_filled', 0)}
+Win rate: {win_rate:.1f}% ({stats.get('winning_trades', 0)}W/{stats.get('losing_trades', 0)}L)
 Consecutive losses: {trader.consecutive_losses}
     """
     await update.message.reply_text(msg, parse_mode='Markdown')
@@ -238,7 +238,6 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await start(update, context)
 
 async def pnl(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # We'll use the same status command for simplicity, but keep pnl for compatibility
     await status(update, context)
 
 async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -279,11 +278,11 @@ async def send_periodic_report(context: ContextTypes.DEFAULT_TYPE):
     """Send a summary every 15 minutes."""
     chat_id = context.job.chat_id
     summary = journal.get_today_summary()
-    stats = summary['stats']
-    total_trades = stats['winning_trades'] + stats['losing_trades']
-    win_rate = (stats['winning_trades'] / total_trades * 100) if total_trades > 0 else 0
-    realized = stats['realized_pnl']
-    unrealized = summary['unrealized_pnl']
+    stats = summary.get('stats', {})
+    total_trades = stats.get('winning_trades', 0) + stats.get('losing_trades', 0)
+    win_rate = (stats.get('winning_trades', 0) / total_trades * 100) if total_trades > 0 else 0
+    realized = stats.get('realized_pnl', 0.0)
+    unrealized = summary.get('unrealized_pnl', 0.0)
     total = realized + unrealized
     drawdown = (1 - trader.capital / trader.peak_capital) * 100 if trader.peak_capital > 0 else 0
     msg = f"""
@@ -293,7 +292,7 @@ Status: {'⏸️ PAUSED' if trader.paused else '▶️ ACTIVE'}
 
 Today:
 Realized: ${realized:.2f} | Unrealized: ${unrealized:.2f} | Total: ${total:.2f}
-Trades: {stats['orders_filled']} | Win Rate: {win_rate:.1f}%
+Trades: {stats.get('orders_filled', 0)} | Win Rate: {win_rate:.1f}%
 Consecutive losses: {trader.consecutive_losses}
     """
     await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode='Markdown')
@@ -310,7 +309,29 @@ async def trader_job(context: ContextTypes.DEFAULT_TYPE):
             alert = f"⏸️ Bot paused because daily loss limit (${trader.DAILY_LOSS_LIMIT:.2f}) was reached."
         else:
             alert = "⏸️ Bot paused (manual or other reason)."
-        await context.bot.send_message(chat_id=context.job.chat_id, text=alert)
+        # Only send if we have a chat_id
+        if context.job.chat_id:
+            await context.bot.send_message(chat_id=context.job.chat_id, text=alert)
+
+async def start_with_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Start command that also schedules periodic jobs."""
+    chat_id = update.effective_chat.id
+    # Remove any existing jobs for this chat
+    current_jobs = context.application.job_queue.jobs()
+    for job in current_jobs:
+        if job.name == f"report_{chat_id}" or job.name == f"trader_{chat_id}":
+            job.schedule_removal()
+    # Schedule periodic report every 15 minutes
+    context.application.job_queue.run_repeating(
+        send_periodic_report, interval=900, first=60, 
+        chat_id=chat_id, name=f"report_{chat_id}"
+    )
+    # Schedule trader job every 60 seconds
+    context.application.job_queue.run_repeating(
+        trader_job, interval=60, first=10, 
+        chat_id=chat_id, name=f"trader_{chat_id}"
+    )
+    await start(update, context)
 
 def main():
     if not TOKEN:
@@ -321,29 +342,8 @@ def main():
         return
 
     app = ApplicationBuilder().token(TOKEN).build()
-    job_queue = app.job_queue
 
-    # Schedule trader job every 60 seconds
-    job_queue.run_repeating(trader_job, interval=60, first=10)
-
-    # Schedule periodic report every 15 minutes (900 seconds)
-    # We need a chat_id – will be set when user sends /start
-    # We'll store chat_id in context.job.data or use a global; simpler: we'll add a command to start reports.
-    # For now, we'll skip automatic report, and user can request /status anytime.
-    # Alternatively, we can store chat_id from the first /start. Let's do that:
-
-    async def start_with_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        # Start the periodic report for this chat
-        chat_id = update.effective_chat.id
-        # Remove any existing job for this chat
-        current_jobs = job_queue.jobs()
-        for job in current_jobs:
-            if job.name == f"report_{chat_id}":
-                job.schedule_removal()
-        job_queue.run_repeating(send_periodic_report, interval=900, first=60, data=chat_id, name=f"report_{chat_id}")
-        await start(update, context)
-
-    # Override start command with the report version
+    # Register handlers
     app.add_handler(CommandHandler("start", start_with_report))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("strategy", strategy))
