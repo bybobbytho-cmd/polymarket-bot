@@ -1,14 +1,19 @@
 """
-Webhook handler for Telegram bot on Railway – with test endpoint.
+Webhook handler for Telegram bot on Railway – with update logging.
 """
 
+import os
+import sys
+import logging
 from fastapi import FastAPI, Request
 from telegram import Update
 from telegram.ext import Application
-import os
-import sys
 
 from telegram_bot import build_application
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = FastAPI()
 BOT_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -18,28 +23,28 @@ bot_app = None
 async def startup_event():
     global bot_app
     if not BOT_TOKEN:
-        print("❌ TELEGRAM_TOKEN not set!")
+        logger.error("❌ TELEGRAM_TOKEN not set!")
         sys.exit(1)
 
     public_domain = os.getenv("RAILWAY_PUBLIC_DOMAIN")
     if not public_domain:
-        print("❌ RAILWAY_PUBLIC_DOMAIN not set. Generate a domain in Railway Networking.")
+        logger.error("❌ RAILWAY_PUBLIC_DOMAIN not set. Generate a domain in Railway Networking.")
         sys.exit(1)
 
     webhook_url = f"https://{public_domain}/webhook"
-    print(f"🌐 Setting webhook to: {webhook_url}")
+    logger.info(f"🌐 Setting webhook to: {webhook_url}")
 
     bot_app = await build_application()
 
     # Delete any existing webhook first
     await bot_app.bot.delete_webhook()
     await bot_app.bot.set_webhook(webhook_url)
-    print(f"✅ Webhook set successfully to {webhook_url}")
+    logger.info(f"✅ Webhook set successfully to {webhook_url}")
 
 @app.on_event("shutdown")
 async def shutdown_event():
     if bot_app:
-        print("🧹 Deleting webhook...")
+        logger.info("🧹 Deleting webhook...")
         await bot_app.bot.delete_webhook()
         await bot_app.stop()
         await bot_app.shutdown()
@@ -47,6 +52,7 @@ async def shutdown_event():
 @app.post("/webhook")
 async def webhook(request: Request):
     json_data = await request.json()
+    logger.info(f"📥 Received update: {json_data}")
     update = Update.de_json(json_data, bot_app.bot)
     await bot_app.process_update(update)
     return "ok"
