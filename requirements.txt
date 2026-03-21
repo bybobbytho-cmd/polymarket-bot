@@ -1,11 +1,3 @@
-fastapi
-uvicorn
 python-telegram-bot[job-queue]
 requests
 python-dotenv
-web3
-matplotlib
-pandas
-numpy
-schedule
-beautifulsoup4
