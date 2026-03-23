@@ -60,39 +60,53 @@ class PaperTrader:
         """
         if not self.USE_ORDERBOOK:
             # Fallback: use oracle midpoint
-            # We need to find the market's asset and interval from slug – simplified for now
-            # In reality you'd parse slug or ask the oracle. We'll assume we have a way.
-            # For simplicity, we'll return the current oracle price (which your original code does)
-            # Placeholder: call the method that gets current price from your existing logic.
-            return self._get_oracle_midpoint(slug, side)
+            return self._get_oracle_price(slug, side)
 
         # Use order book
         yes_token, no_token = get_token_id_from_slug(slug)
         token_id = yes_token if side == 'YES' else no_token
         if not token_id:
-            # Fallback to oracle
-            return self._get_oracle_midpoint(slug, side)
+            # Order book failed, fall back to oracle
+            return self._get_oracle_price(slug, side)
 
         if action == 'enter':
             # Buying: we pay the ask
-            avg_price, _ = simulate_market_order(token_id, 'buy', 1.0)  # simulate buying 1 share
-            return avg_price
+            avg_price, _ = simulate_market_order(token_id, 'buy', 1.0)
+            if avg_price > 0:
+                return avg_price
+            else:
+                return self._get_oracle_price(slug, side)
         else:  # exit
             # Selling: we receive the bid
-            avg_price, _ = simulate_market_order(token_id, 'sell', 1.0)  # simulate selling 1 share
-            return avg_price
+            avg_price, _ = simulate_market_order(token_id, 'sell', 1.0)
+            if avg_price > 0:
+                return avg_price
+            else:
+                return self._get_oracle_price(slug, side)
 
-    def _get_oracle_midpoint(self, slug: str, side: str) -> float:
-        """Fallback: get the current oracle price (midpoint) for the market."""
-        # This is a simplified version; you should adapt to your existing method
-        # For now, we'll assume the oracle gives up/down prices.
-        # We need to map slug back to asset and interval. In your original trader,
-        # you probably already have a way to get the current price. We'll call that.
-        # As a placeholder, return 0.5. You should replace this with your actual logic.
-        # For example: up, down, _ = self.fetch_price_from_oracle(asset, interval)
-        # Then return up if side == 'YES' else down.
-        print(f"Warning: Falling back to oracle midpoint for {slug} {side}")
-        return 0.5
+    def _get_oracle_price(self, slug: str, side: str) -> float:
+        """
+        Get the current oracle price for a market (midpoint).
+        For YES, return the 'up' price; for NO, return the 'down' price.
+        """
+        # Extract asset and interval from slug
+        try:
+            parts = slug.split('-')
+            if len(parts) >= 3:
+                asset = parts[0]          # e.g., "btc"
+                interval = parts[2]       # e.g., "5m" or "15m"
+            else:
+                asset = "btc"
+                interval = "5m"
+            up, down, _ = self.fetch_price_from_oracle(asset, interval)
+            if up is not None and down is not None:
+                return up if side == 'YES' else down
+            else:
+                print(f"Oracle returned None for {slug} {side}")
+                return 0.5
+        except Exception as e:
+            print(f"Oracle fallback error: {e}")
+            return 0.5
 
     def run_cycle(self):
         """Main trading loop – called every 60 seconds."""
@@ -106,8 +120,6 @@ class PaperTrader:
             return
 
         # For now, we'll trade both BTC 5m and 15m markets
-        # In your original code, you likely have a list of markets to check.
-        # We'll generate signals for the current windows.
         now = int(time.time())
         for market_base in ['btc-updown-5m', 'btc-updown-15m']:
             if market_base.endswith('5m'):
@@ -122,10 +134,14 @@ class PaperTrader:
 
             # Get oracle prices
             # We need asset and interval. From slug, we can parse.
-            # Let's assume we have a method to get them.
-            # For demonstration, we'll use a placeholder.
-            # Replace with your actual logic.
-            up, down, _ = self.fetch_price_from_oracle('btc', '5m')  # adjust
+            parts = slug.split('-')
+            if len(parts) >= 3:
+                asset = parts[0]
+                interval = parts[2]
+            else:
+                asset = "btc"
+                interval = "5m"
+            up, down, _ = self.fetch_price_from_oracle(asset, interval)
             if up is None or down is None:
                 continue
 
@@ -148,9 +164,10 @@ class PaperTrader:
                 current_price = self.get_market_price(slug, pos['side'], 'exit')
                 if current_price <= 0:
                     continue
-                pnl_pct = (current_price - pos['entry_price']) / pos['entry_price']
-                if pos['side'] == 'NO':
-                    pnl_pct = -pnl_pct  # because NO price moves opposite to YES
+                if pos['side'] == 'YES':
+                    pnl_pct = (current_price - pos['entry_price']) / pos['entry_price']
+                else:
+                    pnl_pct = (pos['entry_price'] - current_price) / pos['entry_price']
 
                 if pnl_pct >= self.TAKE_PROFIT_PCT:
                     self._exit_position(slug, current_price, profit=True)
@@ -164,7 +181,6 @@ class PaperTrader:
         self.positions[slug] = {'side': side, 'entry_price': price, 'size': size}
         self.capital -= size * price
         if self.capital < 0:
-            # This should not happen, but cap at 0
             self.capital = 0
         self.journal.record_order(slug, side, price, size, 'BUY')
         print(f"Entered {slug} {side} @ {price:.3f}")
@@ -204,6 +220,3 @@ class PaperTrader:
         if self.consecutive_losses >= self.CONSECUTIVE_LOSS_LIMIT:
             self.paused = True
             print(f"Auto‑paused after {self.consecutive_losses} consecutive losses.")
-
-    # Other existing methods (like get_today_summary, etc.) should remain unchanged.
-    # If you have them in your original trader.py, add them here.

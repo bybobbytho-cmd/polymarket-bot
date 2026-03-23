@@ -6,12 +6,15 @@ Records trades, generates summaries, and exports data.
 import os
 import json
 import csv
+import logging
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
 
 import matplotlib.pyplot as plt
 import pandas as pd
+
+logger = logging.getLogger(__name__)
 
 class PolymarketJournal:
     def __init__(self, paper_mode: bool = True):
@@ -40,9 +43,15 @@ class PolymarketJournal:
     def _load_today_trades(self):
         """Load today's trades from JSONL file."""
         trades_file = self.trades_dir / f"fills_{self.daily_date}.jsonl"
-        if trades_file.exists():
-            with open(trades_file, "r") as f:
-                for line in f:
+        if not trades_file.exists():
+            logger.info(f"No existing trades file for {self.daily_date}")
+            return
+
+        logger.info(f"Loading trades from {trades_file}")
+        line_count = 0
+        with open(trades_file, "r") as f:
+            for line in f:
+                try:
                     trade = json.loads(line)
                     data = trade["data"]
                     if "pnl" in data and data["pnl"] is not None:
@@ -57,6 +66,10 @@ class PolymarketJournal:
                     else:
                         # Open position
                         self.open_positions[data["market"]] = data
+                    line_count += 1
+                except Exception as e:
+                    logger.error(f"Error parsing trade line: {e}\nLine: {line}")
+        logger.info(f"Loaded {line_count} trades. Realized PnL: {self.daily_stats['realized_pnl']}")
 
     def record_order(self, market: str, side: str, price: float, size: float, order_type: str, pnl: Optional[float] = None):
         """Record a trade (buy or sell)."""
@@ -65,14 +78,14 @@ class PolymarketJournal:
             "market": market,
             "side": side,
             "price": price,
-            "size": size,
+            "size": float(size),          # ensure float
             "order_type": order_type,
         }
         if pnl is not None:
             trade["pnl"] = pnl
             # Update daily stats
             self.daily_stats["realized_pnl"] += pnl
-            self.daily_stats["total_volume"] += float(size)  # <-- FIXED: convert to float
+            self.daily_stats["total_volume"] += float(size)
             self.daily_stats["orders_filled"] += 1
             if pnl > 0:
                 self.daily_stats["winning_trades"] += 1
@@ -86,6 +99,7 @@ class PolymarketJournal:
         trades_file = self.trades_dir / f"fills_{self.daily_date}.jsonl"
         with open(trades_file, "a") as f:
             f.write(json.dumps({"type": order_type, "data": trade}) + "\n")
+        logger.debug(f"Recorded {order_type} {market} {side} @ {price} size {size}")
 
     def get_today_summary(self) -> Dict:
         """Return a summary of today's trades."""
@@ -102,8 +116,6 @@ class PolymarketJournal:
         """Calculate unrealized PnL for an open position using current market price."""
         # This is a placeholder – you should implement actual price fetching
         # For now, we assume no unrealized PnL (or use oracle price)
-        # In a real implementation, you'd query the oracle for current price.
-        # We'll keep it as 0 to avoid double counting.
         return 0.0
 
     def export_to_csv(self):
@@ -124,9 +136,3 @@ class PolymarketJournal:
         df = pd.DataFrame(trades)
         csv_file = self.summaries_dir / f"trades_{self.daily_date}.csv"
         df.to_csv(csv_file, index=False)
-
-    # Optional: add methods to generate charts
-    def plot_daily_pnl(self):
-        """Generate a simple chart of daily PnL."""
-        # This would require loading historical data
-        pass
