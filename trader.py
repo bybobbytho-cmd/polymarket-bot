@@ -27,7 +27,7 @@ class PaperTrader:
                             'winning_trades': 0, 'losing_trades': 0}
         
         # Advisory parameters
-        self.MIN_EDGE = 0.01  # 1% (lower for testing)
+        self.MIN_EDGE = 0.005  # 0.5% edge (for testing)
         self.external = ExternalSignals()
         self.signals = {}          # market_slug -> signal dict
         self.last_sent_signal = {} # slug -> timestamp
