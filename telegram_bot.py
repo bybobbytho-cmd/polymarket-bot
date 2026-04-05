@@ -1,12 +1,9 @@
 """
-Telegram Bot for Polymarket – Polling version, plain text only.
+Telegram Bot – Advisory with manual /signal command and automatic alerts.
 """
 
 import os
-import requests
-import json
 from datetime import datetime
-from pathlib import Path
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 from dotenv import load_dotenv
@@ -26,290 +23,163 @@ config = Config()
 journal = PolymarketJournal(paper_mode=True)
 trader = PaperTrader(journal, market_finder, ORACLE_URL, CAPITAL)
 
-COMMAND_MAP = {
-    "updownbtc5m": ("btc", "5m"),
-    "updownbtc15m": ("btc", "15m"),
-    "updowneth5m": ("eth", "5m"),
-    "updowneth15m": ("eth", "15m"),
-}
-
-# ---------- Price fetching ----------
-def fetch_price_from_oracle(asset, interval):
-    if not ORACLE_URL:
-        return None, None, None
-    try:
-        url = f"{ORACLE_URL}/api/price/{asset}/{interval}"
-        resp = requests.get(url, timeout=5)
-        if resp.status_code == 200:
-            data = resp.json()
-            return data.get('up'), data.get('down'), data
-    except Exception as e:
-        print(f"Oracle error: {e}")
-    return None, None, None
-
-def format_market_response(asset, interval, up, down, slug, title, end_date):
-    if up is None or down is None:
-        return f"❌ Price unavailable for {asset} {interval} at this moment"
-    up_cents = up * 100
-    down_cents = down * 100
-    try:
-        if end_date:
-            dt = datetime.fromisoformat(end_date.replace('Z', '+00:00'))
-            time_str = dt.strftime("%b %d, %I:%M%p ET").replace(" 0", " ")
-        else:
-            time_str = "Unknown time"
-    except:
-        time_str = "Unknown time"
+# ---------- Helper to format signal message ----------
+def format_signal(signal, market_name):
+    if not signal or not signal.get('actionable'):
+        return f"🔍 *{market_name}*: No clear edge right now."
+    side = signal['side']
+    ask = signal['ask_price']
+    fair = signal['fair_value']
+    edge = signal['edge'] * 100
+    if side == 'YES':
+        recommendation = "✅ *BUY YES* at ask price or better"
+    else:
+        recommendation = "✅ *BUY NO* at ask price or better"
     return (
-        f"📈 {title}\n"
-        f"Slug: {slug}\n"
-        f"Ends: {time_str}\n\n"
-        f"UP: {up_cents:.0f}¢\n"
-        f"DOWN: {down_cents:.0f}¢\n\n"
-        f"Source: Working bot oracle"
+        f"📈 *{market_name}*\n"
+        f"{recommendation}\n"
+        f"Market Price (Ask): ${ask:.3f}\n"
+        f"Fair Value: ${fair:.3f}\n"
+        f"Edge: {edge:.1f}%\n"
+        f"Suggested Stake: $1.00"
     )
 
-# ---------- Handlers (plain text) ----------
-async def updown_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    command = update.message.text[1:]
-    if command not in COMMAND_MAP:
-        await update.message.reply_text("❌ Unknown command")
-        return
-    asset, interval = COMMAND_MAP[command]
-    minutes = 5 if interval == "5m" else 15
-    up, down, oracle_data = fetch_price_from_oracle(asset, interval)
-    if oracle_data is None:
-        await update.message.reply_text("❌ Oracle not reachable")
-        return
-    slug = oracle_data.get('slug')
-    if not slug:
-        await update.message.reply_text("❌ Oracle returned no slug")
-        return
-    market_data = market_finder.get_market_by_slug(slug)
-    if not market_data:
-        for start in market_finder.candidate_window_starts(minutes):
-            alt_slug = f"{asset}-updown-{interval}-{start}"
-            if alt_slug == slug:
-                continue
-            market_data = market_finder.get_market_by_slug(alt_slug)
-            if market_data:
-                slug = alt_slug
-                break
-    if not market_data:
-        await update.message.reply_text(f"❌ Could not find market data for {slug}")
-        return
-    title = market_data.get('title') or market_data.get('question') or slug
-    end_date = market_data.get('end_date')
-    response = format_market_response(asset, interval, up, down, slug, title, end_date)
-    await update.message.reply_text(response)
+# ---------- Commands ----------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    help_text = (
+        "🤖 *Polymarket Advisory Bot*\n\n"
+        "I analyze external data (CME futures, Binance order book, news) and send you trading signals automatically when there's an edge.\n\n"
+        "You can also manually check any market:\n"
+        "`/signal btc 5m` – get recommendation for Bitcoin 5‑minute market\n"
+        "`/signal btc 15m` – for 15‑minute market\n\n"
+        f"Virtual capital: ${trader.capital:.2f}\n\n"
+        "*Other commands:*\n"
+        "/status – Bot health\n"
+        "/strategy – Strategy parameters\n"
+        "/pause – Pause signal generation\n"
+        "/resume – Resume\n"
+        "/ping – Alive check\n"
+        "/help – This message"
+    )
+    await update.message.reply_text(help_text, parse_mode='Markdown')
 
-async def testprice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def signal_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Manual signal check: /signal btc 5m"""
     if len(context.args) < 2:
-        await update.message.reply_text("Usage: /testprice <asset> <interval> (e.g., /testprice btc 5m)")
+        await update.message.reply_text("Usage: /signal <asset> <interval>\nExample: /signal btc 5m")
         return
-    try:
-        asset = context.args[0].lower()
-        interval = context.args[1].lower()
-        up, down, raw = fetch_price_from_oracle(asset, interval)
-        if raw:
-            await update.message.reply_text(f"Raw oracle response:\n{json.dumps(raw, indent=2)}")
-        else:
-            await update.message.reply_text("Oracle returned no data.")
-    except Exception as e:
-        await update.message.reply_text(f"Error: {e}")
-
-async def start_trader(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    trader.run_cycle()
-    await update.message.reply_text("Trader cycle executed. Check journal for any paper trades.")
-
-async def export_journal(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    journal.export_to_csv()
-    today = datetime.now().strftime('%Y%m%d')
-    csv_file = Path("data/journal/summaries") / f"trades_{today}.csv"
-    if csv_file.exists():
-        with open(csv_file, 'rb') as f:
-            await update.message.reply_document(f, filename=f"trades_{today}.csv", caption="Today's paper trades.")
-    else:
-        await update.message.reply_text("No trades file found for today.")
-
-async def list_trades(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    trades_file = Path("data/journal/trades") / f"fills_{datetime.now().strftime('%Y%m%d')}.jsonl"
-    if not trades_file.exists():
-        await update.message.reply_text("📭 No trades today.")
+    asset = context.args[0].lower()
+    interval = context.args[1].lower()
+    if asset not in ['btc'] or interval not in ['5m', '15m']:
+        await update.message.reply_text("Only 'btc' with '5m' or '15m' supported for now.")
         return
-    trades = []
-    with open(trades_file, 'r') as f:
-        for line in f:
-            trades.append(json.loads(line))
-    if not trades:
-        await update.message.reply_text("📭 No trades today.")
-        return
-    recent = trades[-10:]
-    lines = []
-    for t in recent:
-        data = t['data']
-        timestamp = t['timestamp'] if 'timestamp' in t else data.get('entry_time', 'unknown')
-        side = data['side'].upper()
-        market = data['market']
-        price = data['price']
-        stake = data['size']
-        lines.append(f"🕒 {timestamp}\n{market}\n{side} @ ${price:.3f} | stake ${stake:.2f}")
-    msg = "📋 Last 10 paper trades\n\n" + "\n\n".join(lines)
-    await update.message.reply_text(msg)
+    signal = trader.get_signal(asset, interval)
+    market_name = f"{asset.upper()} {interval}"
+    msg = format_signal(signal, market_name)
+    await update.message.reply_text(msg, parse_mode='Markdown')
+
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    summary = trader.get_status()
+    cap = summary['capital']
+    peak = summary['peak_capital']
+    drawdown = (1 - cap/peak)*100 if peak>0 else 0
+    stats = summary['journal_summary'].get('stats', {})
+    realized = stats.get('realized_pnl', 0.0)
+    trades = stats.get('orders_filled', 0)
+    wins = stats.get('winning_trades', 0)
+    losses = stats.get('losing_trades', 0)
+    win_rate = wins / max(1, wins+losses) * 100
+    msg = f"""
+📊 *BOT STATUS*
+Capital: ${cap:.2f} | Peak: ${peak:.2f} | Drawdown: {drawdown:.1f}%
+Status: {'⏸️ PAUSED' if summary['paused'] else '▶️ ACTIVE'}
+
+📈 Today (paper):
+Realized PnL: ${realized:.2f}
+Trades: {trades} | Win Rate: {win_rate:.1f}%
+Consecutive losses: {summary['consecutive_losses']}
+    """
+    await update.message.reply_text(msg, parse_mode='Markdown')
 
 async def strategy(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
-        f"📊 Current Strategy\n\n"
-        f"Simple mean‑reversion on BTC 5m & 15m:\n"
-        f"- Entry threshold: {trader.ENTRY_THRESHOLD}\n"
-        f"- Take profit: {trader.TAKE_PROFIT_PCT*100}%\n"
-        f"- Stop loss: {trader.STOP_LOSS_PCT*100}%\n"
-        f"- Consecutive loss limit: {trader.CONSECUTIVE_LOSS_LIMIT}\n"
-        f"- Daily loss limit: ${trader.DAILY_LOSS_LIMIT:.2f}\n"
-        f"Virtual capital: ${trader.capital:.2f}\n"
-        f"Status: {'PAUSED' if trader.paused else 'ACTIVE'}"
+        "📊 *Strategy Parameters*\n\n"
+        "- External signals: CME futures (40%), Binance order book imbalance (40%), news sentiment (20%)\n"
+        "- Fair value = weighted combination\n"
+        "- Edge = (fair value - ask) / ask\n"
+        "- Min edge threshold: 2% (adjustable in trader.py)\n"
+        "- Signals sent automatically when edge > 2%"
     )
-    await update.message.reply_text(msg)
+    await update.message.reply_text(msg, parse_mode='Markdown')
 
 async def pause(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    trader.paused = True
-    await update.message.reply_text("⏸️ Bot paused. No new trades will be entered.")
+    trader.pause()
+    await update.message.reply_text("⏸️ Signal generation paused.")
 
 async def resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    trader.paused = False
-    trader.consecutive_losses = 0
-    await update.message.reply_text("▶️ Bot resumed. New trades may be entered.")
+    trader.resume()
+    await update.message.reply_text("▶️ Signal generation resumed.")
 
-async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    summary = journal.get_today_summary()
-    stats = summary.get('stats', {})
-    total_trades = stats.get('winning_trades', 0) + stats.get('losing_trades', 0)
-    win_rate = (stats.get('winning_trades', 0) / total_trades * 100) if total_trades > 0 else 0
-    realized = stats.get('realized_pnl', 0.0)
-    unrealized = summary.get('unrealized_pnl', 0.0)
-    total = realized + unrealized
-    drawdown = (1 - trader.capital / trader.peak_capital) * 100 if trader.peak_capital > 0 else 0
-    msg = f"""
-📊 BOT STATUS
-Virtual capital: ${trader.capital:.2f}
-Peak capital: ${trader.peak_capital:.2f}
-Drawdown: {drawdown:.1f}%
-Status: {'PAUSED' if trader.paused else 'ACTIVE'}
-
-📈 Today:
-Realized PnL: ${realized:.2f}
-Unrealized PnL: ${unrealized:.2f}
-Total PnL: ${total:.2f}
-Trades: {stats.get('orders_filled', 0)}
-Win rate: {win_rate:.1f}% ({stats.get('winning_trades', 0)}W/{stats.get('losing_trades', 0)}L)
-Consecutive losses: {trader.consecutive_losses}
-    """
-    await update.message.reply_text(msg)
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    help_text = (
-        "🤖 Polymarket Bot\n\n"
-        f"Virtual capital: ${trader.capital:.2f}\n\n"
-        "Commands:\n"
-        "/updownbtc5m – BTC 5m prices\n"
-        "/updownbtc15m – BTC 15m prices\n"
-        "/updowneth5m – ETH 5m prices\n"
-        "/updowneth15m – ETH 15m prices\n"
-        "/pnl – Today's performance\n"
-        "/trades – List today's paper trades\n"
-        "/positions – Current open positions\n"
-        "/history – Last 5 trades\n"
-        "/balance – Your virtual balance\n"
-        "/status – Bot health and stats\n"
-        "/strategy – Show current parameters\n"
-        "/pause – Pause new trades\n"
-        "/resume – Resume trading\n"
-        "/testprice btc 5m – Raw oracle output\n"
-        "/start_trader – Run one trader cycle\n"
-        "/export – Download today's trade CSV\n"
-        "/help – This message"
-    )
-    await update.message.reply_text(help_text)
+async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🏓 Pong! Bot is alive.")
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await start(update, context)
 
-async def pnl(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await status(update, context)
-
-async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"💰 VIRTUAL BALANCE\n\nCurrent capital: ${trader.capital:.2f}")
-
-async def positions(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not trader.positions:
-        await update.message.reply_text("📭 No Open Positions")
-        return
-    out = "📈 OPEN POSITIONS\n\n"
-    for slug, pos in trader.positions.items():
-        out += f"{slug}\n   Side: {pos['side'].upper()}\n   Entry: ${pos['entry_price']:.3f}\n   Stake: ${pos['size']:.2f}\n\n"
-    await update.message.reply_text(out)
-
-async def history(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    trades_file = Path("data/journal/trades") / f"fills_{datetime.now().strftime('%Y%m%d')}.jsonl"
-    if not trades_file.exists():
-        await update.message.reply_text("📭 No Trades Today")
-        return
-    trades = []
-    with open(trades_file) as f:
-        for line in f:
-            trades.append(json.loads(line))
-    if not trades:
-        await update.message.reply_text("📭 No Trades Today")
-        return
-    out = "📋 LAST 5 TRADES\n\n"
-    for trade in trades[-5:]:
-        d = trade['data']
-        stake = d['size']
-        pnl = d.get('pnl', 0.0)
-        sign = "✅" if pnl > 0 else "❌" if pnl < 0 else "⚪"
-        out += f"{sign} {d['market']} {d['side'].upper()}\n   ${d['price']:.3f} | Stake ${stake:.2f} | PnL ${pnl:.2f}\n\n"
-    await update.message.reply_text(out)
-
 # ---------- Background Jobs ----------
 async def send_periodic_report(context: ContextTypes.DEFAULT_TYPE):
     chat_id = context.job.chat_id
-    summary = journal.get_today_summary()
-    stats = summary.get('stats', {})
-    total_trades = stats.get('winning_trades', 0) + stats.get('losing_trades', 0)
-    win_rate = (stats.get('winning_trades', 0) / total_trades * 100) if total_trades > 0 else 0
+    status_data = trader.get_status()
+    cap = status_data['capital']
+    peak = status_data['peak_capital']
+    drawdown = (1 - cap/peak)*100 if peak>0 else 0
+    stats = status_data['journal_summary'].get('stats', {})
     realized = stats.get('realized_pnl', 0.0)
-    unrealized = summary.get('unrealized_pnl', 0.0)
-    total = realized + unrealized
-    drawdown = (1 - trader.capital / trader.peak_capital) * 100 if trader.peak_capital > 0 else 0
+    trades = stats.get('orders_filled', 0)
+    wins = stats.get('winning_trades', 0)
+    losses = stats.get('losing_trades', 0)
+    win_rate = wins / max(1, wins+losses) * 100
     msg = f"""
-📊 15‑MINUTE REPORT
-Capital: ${trader.capital:.2f} | Peak: ${trader.peak_capital:.2f} | Drawdown: {drawdown:.1f}%
-Status: {'PAUSED' if trader.paused else 'ACTIVE'}
+📊 *15‑MINUTE REPORT*
+Capital: ${cap:.2f} | Peak: ${peak:.2f} | Drawdown: {drawdown:.1f}%
+Status: {'⏸️ PAUSED' if status_data['paused'] else '▶️ ACTIVE'}
 
 Today:
-Realized: ${realized:.2f} | Unrealized: ${unrealized:.2f} | Total: ${total:.2f}
-Trades: {stats.get('orders_filled', 0)} | Win Rate: {win_rate:.1f}%
-Consecutive losses: {trader.consecutive_losses}
+Realized PnL: ${realized:.2f}
+Trades: {trades} | Win Rate: {win_rate:.1f}%
+Consecutive losses: {status_data['consecutive_losses']}
     """
-    await context.bot.send_message(chat_id=chat_id, text=msg)
+    await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode='Markdown')
 
 async def trader_job(context: ContextTypes.DEFAULT_TYPE):
     trader.run_cycle()
-    if trader.paused and context.job.chat_id:
-        if trader.consecutive_losses >= 3:
-            alert = f"⏸️ Bot paused due to {trader.consecutive_losses} consecutive losses."
-        elif journal.daily_stats['realized_pnl'] <= -trader.DAILY_LOSS_LIMIT:
-            alert = f"⏸️ Bot paused because daily loss limit (${trader.DAILY_LOSS_LIMIT:.2f}) was reached."
-        else:
-            alert = "⏸️ Bot paused (manual or other reason)."
-        await context.bot.send_message(chat_id=context.job.chat_id, text=alert)
+
+async def auto_signal_job(context: ContextTypes.DEFAULT_TYPE):
+    """Send automatic alert for any market that has an actionable signal."""
+    chat_id = context.job.chat_id
+    for slug, signal in trader.signals.items():
+        if signal.get('actionable'):
+            # Avoid duplicate alerts for the same market
+            last_sent = trader.last_sent_signal.get(slug, 0)
+            if signal['timestamp'] > last_sent:
+                trader.last_sent_signal[slug] = signal['timestamp']
+                # Extract market name from slug (e.g., btc-updown-5m-123456)
+                parts = slug.split('-')
+                if len(parts) >= 3:
+                    market_name = f"{parts[0].upper()} {parts[2]}"
+                else:
+                    market_name = slug
+                msg = format_signal(signal, market_name)
+                await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode='Markdown')
 
 async def start_with_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
+    # Remove existing jobs
     current_jobs = context.application.job_queue.jobs()
     for job in current_jobs:
-        if job.name == f"report_{chat_id}" or job.name == f"trader_{chat_id}":
+        if job.name in [f"report_{chat_id}", f"trader_{chat_id}", f"auto_signal_{chat_id}"]:
             job.schedule_removal()
+    # Schedule jobs
     context.application.job_queue.run_repeating(
         send_periodic_report, interval=900, first=60,
         chat_id=chat_id, name=f"report_{chat_id}"
@@ -318,6 +188,10 @@ async def start_with_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
         trader_job, interval=60, first=10,
         chat_id=chat_id, name=f"trader_{chat_id}"
     )
+    context.application.job_queue.run_repeating(
+        auto_signal_job, interval=60, first=5,
+        chat_id=chat_id, name=f"auto_signal_{chat_id}"
+    )
     await start(update, context)
 
 # ---------- Main ----------
@@ -325,31 +199,16 @@ def main():
     if not TOKEN:
         print("❌ TELEGRAM_TOKEN not found")
         return
-    if not ORACLE_URL:
-        print("❌ PRICE_ORACLE_URL not set in environment")
-        return
-
     app = ApplicationBuilder().token(TOKEN).build()
-
     app.add_handler(CommandHandler("start", start_with_report))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("strategy", strategy))
-    app.add_handler(CommandHandler("ping", lambda u,c: u.message.reply_text("🏓 Pong!")))
+    app.add_handler(CommandHandler("ping", ping))
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("pause", pause))
     app.add_handler(CommandHandler("resume", resume))
-    app.add_handler(CommandHandler("pnl", pnl))
-    app.add_handler(CommandHandler("balance", balance))
-    app.add_handler(CommandHandler("positions", positions))
-    app.add_handler(CommandHandler("history", history))
-    app.add_handler(CommandHandler("testprice", testprice))
-    app.add_handler(CommandHandler("start_trader", start_trader))
-    app.add_handler(CommandHandler("export", export_journal))
-    app.add_handler(CommandHandler("trades", list_trades))
-    for cmd, (asset, interval) in COMMAND_MAP.items():
-        app.add_handler(CommandHandler(cmd, updown_handler))
-
-    print("🤖 Telegram bot started with paper trading job (every 60s) on BTC 5m & 15m.")
+    app.add_handler(CommandHandler("signal", signal_command))
+    print("🤖 Advisory bot started. Use /signal btc 5m or wait for automatic alerts.")
     app.run_polling()
 
 if __name__ == "__main__":

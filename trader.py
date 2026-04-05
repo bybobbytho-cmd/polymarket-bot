@@ -1,5 +1,6 @@
 """
-Paper Trader for Polymarket – with realistic order book execution and fees.
+Paper Trader for Polymarket – Advisory version (no auto‑trading).
+Stores signals for each market so Telegram can query them.
 """
 
 import os
@@ -8,118 +9,62 @@ import requests
 from datetime import datetime
 from typing import Dict, Optional, Tuple
 
-from config import MinuteMarketFinder
+from config import MinuteMarketFinder, Config
 from journal import PolymarketJournal
-from orderbook import get_token_id_from_slug, simulate_market_order
+from orderbook import get_token_id_from_slug, get_order_book
+from external_signals import ExternalSignals
 
 class PaperTrader:
     def __init__(self, journal: PolymarketJournal, market_finder: MinuteMarketFinder, 
-                 oracle_url: str, capital: float = 10.0):
+                 oracle_url: str = None, capital: float = 10.0):
         self.journal = journal
         self.market_finder = market_finder
         self.oracle_url = oracle_url
         self.capital = capital
         self.peak_capital = capital
-        self.positions = {}  # market_slug -> {'side': 'YES'/'NO', 'entry_price': float, 'size': float}
+        self.positions = {}          # not used, but kept for compatibility
         self.paused = False
         self.consecutive_losses = 0
         self.daily_stats = {'realized_pnl': 0.0, 'orders_filled': 0,
                             'winning_trades': 0, 'losing_trades': 0}
         
         # Strategy parameters
-        self.ENTRY_THRESHOLD = 0.20        # buy YES when up_price < 0.20, etc.
-        self.TAKE_PROFIT_PCT = 0.10        # 10% profit
-        self.STOP_LOSS_PCT = 0.20          # 20% loss
+        self.ENTRY_THRESHOLD = 0.20
+        self.TAKE_PROFIT_PCT = 0.10
+        self.STOP_LOSS_PCT = 0.20
         self.CONSECUTIVE_LOSS_LIMIT = 3
-        self.DAILY_LOSS_LIMIT = 5.0        # in USD
+        self.DAILY_LOSS_LIMIT = 5.0
+        self.USE_ORDERBOOK = True
+        self.FEE_PCT = 0.01
         
-        # Realism settings
-        self.USE_ORDERBOOK = True           # set to False to fall back to oracle price
-        self.FEE_PCT = 0.01                # 1% fee on winning trades
+        # Advisory specific
+        self.external = ExternalSignals()
+        self.signals = {}          # market_slug -> {'side', 'ask_price', 'fair_value', 'edge', 'actionable', 'timestamp'}
+        self.last_sent_signal = {} # market_slug -> timestamp of last sent alert
 
-    def fetch_price_from_oracle(self, asset: str, interval: str) -> Tuple[Optional[float], Optional[float], Optional[dict]]:
-        """Get up/down prices and raw data from the oracle."""
-        if not self.oracle_url:
-            return None, None, None
-        try:
-            url = f"{self.oracle_url}/api/price/{asset}/{interval}"
-            resp = requests.get(url, timeout=5)
-            if resp.status_code == 200:
-                data = resp.json()
-                return data.get('up'), data.get('down'), data
-        except Exception as e:
-            print(f"Oracle error: {e}")
+    # ---------- Compatibility stubs ----------
+    def fetch_price_from_oracle(self, asset, interval):
         return None, None, None
 
-    def get_market_price(self, slug: str, side: str, action: str) -> float:
-        """
-        Get the price at which we can actually trade.
-        side: 'YES' or 'NO'
-        action: 'enter' or 'exit'
-        Returns price per share.
-        """
-        if not self.USE_ORDERBOOK:
-            # Fallback: use oracle midpoint
-            return self._get_oracle_price(slug, side)
+    def get_market_price(self, slug, side, action):
+        return 0.0
 
-        # Use order book
-        yes_token, no_token = get_token_id_from_slug(slug)
-        token_id = yes_token if side == 'YES' else no_token
-        if not token_id:
-            # Order book failed, fall back to oracle
-            return self._get_oracle_price(slug, side)
+    def _enter_position(self, slug, side, price, size):
+        pass
 
-        if action == 'enter':
-            # Buying: we pay the ask
-            avg_price, _ = simulate_market_order(token_id, 'buy', 1.0)
-            if avg_price > 0:
-                return avg_price
-            else:
-                return self._get_oracle_price(slug, side)
-        else:  # exit
-            # Selling: we receive the bid
-            avg_price, _ = simulate_market_order(token_id, 'sell', 1.0)
-            if avg_price > 0:
-                return avg_price
-            else:
-                return self._get_oracle_price(slug, side)
+    def _exit_position(self, slug, price, profit):
+        pass
 
-    def _get_oracle_price(self, slug: str, side: str) -> float:
-        """
-        Get the current oracle price for a market (midpoint).
-        For YES, return the 'up' price; for NO, return the 'down' price.
-        """
-        # Extract asset and interval from slug
-        try:
-            parts = slug.split('-')
-            if len(parts) >= 3:
-                asset = parts[0]          # e.g., "btc"
-                interval = parts[2]       # e.g., "5m" or "15m"
-            else:
-                asset = "btc"
-                interval = "5m"
-            up, down, _ = self.fetch_price_from_oracle(asset, interval)
-            if up is not None and down is not None:
-                return up if side == 'YES' else down
-            else:
-                print(f"Oracle returned None for {slug} {side}")
-                return 0.5
-        except Exception as e:
-            print(f"Oracle fallback error: {e}")
-            return 0.5
-
+    # ---------- Main cycle: update signals for all markets ----------
     def run_cycle(self):
-        """Main trading loop – called every 60 seconds."""
         if self.paused:
             return
 
-        # Check daily loss limit
         if self.daily_stats['realized_pnl'] <= -self.DAILY_LOSS_LIMIT:
             print(f"Daily loss limit reached. Pausing.")
             self.paused = True
             return
 
-        # For now, we'll trade both BTC 5m and 15m markets
         now = int(time.time())
         for market_base in ['btc-updown-5m', 'btc-updown-15m']:
             if market_base.endswith('5m'):
@@ -132,91 +77,73 @@ class PaperTrader:
             if not market_data:
                 continue
 
-            # Get oracle prices
-            # We need asset and interval. From slug, we can parse.
-            parts = slug.split('-')
-            if len(parts) >= 3:
-                asset = parts[0]
-                interval = parts[2]
-            else:
-                asset = "btc"
-                interval = "5m"
-            up, down, _ = self.fetch_price_from_oracle(asset, interval)
-            if up is None or down is None:
+            # Get Polymarket ask price for YES from order book
+            yes_token, no_token = get_token_id_from_slug(slug)
+            if not yes_token:
                 continue
+            book = get_order_book(yes_token)
+            if not book.get('asks'):
+                continue
+            ask_price = float(book['asks'][0][0])
 
-            # Entry logic
-            # Example: buy YES when up < 0.20
-            if up < self.ENTRY_THRESHOLD and slug not in self.positions:
-                price = self.get_market_price(slug, 'YES', 'enter')
-                if price > 0:
-                    self._enter_position(slug, 'YES', price, 1.0)
+            # Get fair value from external signals
+            fair_value = self.external.get_fair_value_yes()
 
-            # Similarly for NO
-            if down < self.ENTRY_THRESHOLD and slug not in self.positions:
-                price = self.get_market_price(slug, 'NO', 'enter')
-                if price > 0:
-                    self._enter_position(slug, 'NO', price, 1.0)
+            # Calculate edge
+            if ask_price > 0:
+                edge = (fair_value - ask_price) / ask_price
+            else:
+                edge = 0
 
-            # Check existing positions for take profit / stop loss
-            if slug in self.positions:
-                pos = self.positions[slug]
-                current_price = self.get_market_price(slug, pos['side'], 'exit')
-                if current_price <= 0:
-                    continue
-                if pos['side'] == 'YES':
-                    pnl_pct = (current_price - pos['entry_price']) / pos['entry_price']
-                else:
-                    pnl_pct = (pos['entry_price'] - current_price) / pos['entry_price']
+            MIN_EDGE = 0.02  # 2% threshold
 
-                if pnl_pct >= self.TAKE_PROFIT_PCT:
-                    self._exit_position(slug, current_price, profit=True)
-                elif pnl_pct <= -self.STOP_LOSS_PCT:
-                    self._exit_position(slug, current_price, profit=False)
+            # Determine recommended side
+            if edge > MIN_EDGE:
+                side = 'YES'
+                actionable = True
+            else:
+                # Also check if buying NO could have edge (1 - fair_value vs NO ask)
+                # For simplicity, we only trade YES in this version.
+                side = None
+                actionable = False
 
-    def _enter_position(self, slug: str, side: str, price: float, size: float):
-        """Record a new paper position."""
-        if price <= 0:
-            return
-        self.positions[slug] = {'side': side, 'entry_price': price, 'size': size}
-        self.capital -= size * price
-        if self.capital < 0:
-            self.capital = 0
-        self.journal.record_order(slug, side, price, size, 'BUY')
-        print(f"Entered {slug} {side} @ {price:.3f}")
+            # Store signal
+            self.signals[slug] = {
+                'timestamp': now,
+                'side': side,
+                'ask_price': ask_price,
+                'fair_value': fair_value,
+                'edge': edge,
+                'actionable': actionable
+            }
+            print(f"Signal updated for {slug}: side={side}, edge={edge:.2%}")
 
-    def _exit_position(self, slug: str, price: float, profit: bool):
-        """Close a position, apply fee on profit."""
-        pos = self.positions.pop(slug)
-        if pos['side'] == 'YES':
-            gross_pnl = (price - pos['entry_price']) * pos['size']
-        else:
-            gross_pnl = (pos['entry_price'] - price) * pos['size']
+    # ---------- Method to get signal for a specific market (by slug or by asset/interval) ----------
+    def get_signal(self, asset='btc', interval='5m'):
+        """Return the latest signal for the current market window."""
+        now = int(time.time())
+        period = 300 if interval == '5m' else 900
+        window_start = now - (now % period)
+        slug = f"{asset}-updown-{interval}-{window_start}"
+        signal = self.signals.get(slug)
+        if not signal:
+            return None
+        return signal
 
-        # Apply 1% fee on winning trades
-        if gross_pnl > 0:
-            fee = gross_pnl * self.FEE_PCT
-            net_pnl = gross_pnl - fee
-        else:
-            net_pnl = gross_pnl
+    # ---------- Other methods (pause, resume, etc.) ----------
+    def pause(self):
+        self.paused = True
 
-        self.capital += (pos['size'] * price) + net_pnl  # we get the sale proceeds + pnl
-        self.peak_capital = max(self.peak_capital, self.capital)
+    def resume(self):
+        self.paused = False
+        self.consecutive_losses = 0
 
-        # Update stats
-        self.daily_stats['realized_pnl'] += net_pnl
-        self.daily_stats['orders_filled'] += 1
-        if net_pnl > 0:
-            self.daily_stats['winning_trades'] += 1
-            self.consecutive_losses = 0
-        else:
-            self.daily_stats['losing_trades'] += 1
-            self.consecutive_losses += 1
-
-        self.journal.record_order(slug, pos['side'], price, pos['size'], 'SELL', pnl=net_pnl)
-        print(f"Exited {slug} {pos['side']} @ {price:.3f}, PnL: {net_pnl:.3f}")
-
-        # Check for consecutive loss pause
-        if self.consecutive_losses >= self.CONSECUTIVE_LOSS_LIMIT:
-            self.paused = True
-            print(f"Auto‑paused after {self.consecutive_losses} consecutive losses.")
+    def get_status(self):
+        return {
+            'capital': self.capital,
+            'peak_capital': self.peak_capital,
+            'paused': self.paused,
+            'consecutive_losses': self.consecutive_losses,
+            'daily_stats': self.daily_stats,
+            'journal_summary': self.journal.get_today_summary()
+        }

@@ -5,3 +5,5 @@ web3
 matplotlib
 pandas
 numpy
+yfinance
+textblob
