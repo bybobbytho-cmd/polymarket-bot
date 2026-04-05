@@ -1,5 +1,5 @@
 """
-Telegram Bot – Advisory with no‑space commands and detailed signals.
+Telegram Bot – Advisory with debug command to list signals.
 """
 
 import os
@@ -22,16 +22,22 @@ config = Config()
 journal = PolymarketJournal(paper_mode=True)
 trader = PaperTrader(journal, market_finder, ORACLE_URL, CAPITAL)
 
-# ---------- Helper: get signal with explanation ----------
+# ---------- Helper: format signal with explicit market name ----------
 def get_signal_message(asset='btc', interval='5m'):
     signal = trader.get_signal(asset, interval)
     if not signal:
-        return f"⚠️ No market data for {asset.upper()} {interval}."
+        return f"⚠️ No market data for {asset.upper()} {interval}. The bot may still be initializing. Try again in a minute."
+
+    # Market name for display
+    if asset == 'btc':
+        market_name = f"Bitcoin {interval} market"
+    else:
+        market_name = f"{asset.upper()} {interval} market"
 
     side = signal.get('side')
     if not side or not signal.get('actionable'):
         return (
-            f"📉 *{asset.upper()} {interval}* – No clear edge.\n"
+            f"📉 *{market_name}* – No clear edge.\n"
             f"Market ask (YES): ${signal['ask_price']:.3f}\n"
             f"Fair value (external model): ${signal['fair_value']:.3f}\n"
             f"Edge: {signal['edge']*100:.1f}%\n"
@@ -44,7 +50,7 @@ def get_signal_message(asset='btc', interval='5m'):
 
     # Actionable signal
     msg = (
-        f"🚀 *{asset.upper()} {interval}* – BUY {side} at ask price or better!\n"
+        f"🚀 *{market_name}* – BUY {side} at ask price or better!\n"
         f"Market ask (YES): ${signal['ask_price']:.3f}\n"
         f"Fair value: ${signal['fair_value']:.3f}\n"
         f"Edge: {signal['edge']*100:.1f}%\n"
@@ -65,6 +71,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "*Commands:*\n"
         "/signalbtc5m – recommendation for Bitcoin 5‑minute market\n"
         "/signalbtc15m – recommendation for Bitcoin 15‑minute market\n"
+        "/showsignals – list all stored signals (debug)\n"
         "/status – Bot health\n"
         "/strategy – Strategy parameters\n"
         "/pause – Pause signal generation\n"
@@ -80,6 +87,16 @@ async def signal_btc5m(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def signal_btc15m(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = get_signal_message('btc', '15m')
+    await update.message.reply_text(msg, parse_mode='Markdown')
+
+async def show_signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not trader.signals:
+        await update.message.reply_text("No signals stored yet. The bot may still be initializing. Wait a minute and try again.")
+        return
+    lines = []
+    for slug, sig in trader.signals.items():
+        lines.append(f"`{slug}`: edge={sig['edge']*100:.1f}%, actionable={sig['actionable']}")
+    msg = "📡 *Stored signals:*\n" + "\n".join(lines[:10])  # limit to 10
     await update.message.reply_text(msg, parse_mode='Markdown')
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -141,15 +158,12 @@ async def auto_signal_job(context: ContextTypes.DEFAULT_TYPE):
             last_sent = trader.last_sent_signal.get(slug, 0)
             if signal['timestamp'] > last_sent:
                 trader.last_sent_signal[slug] = signal['timestamp']
-                # Extract market name
                 parts = slug.split('-')
                 if len(parts) >= 3:
-                    market_name = f"{parts[0].upper()} {parts[2]}"
-                else:
-                    market_name = slug
-                # Build message with explanation
-                msg = get_signal_message(parts[0], parts[2])  # asset, interval
-                await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode='Markdown')
+                    asset = parts[0]
+                    interval = parts[2]
+                    msg = get_signal_message(asset, interval)
+                    await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode='Markdown')
 
 async def start_with_jobs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -185,7 +199,8 @@ def main():
     app.add_handler(CommandHandler("resume", resume))
     app.add_handler(CommandHandler("signalbtc5m", signal_btc5m))
     app.add_handler(CommandHandler("signalbtc15m", signal_btc15m))
-    print("🤖 Advisory bot started. Commands: /signalbtc5m, /signalbtc15m")
+    app.add_handler(CommandHandler("showsignals", show_signals))
+    print("🤖 Advisory bot started. Commands: /signalbtc5m, /signalbtc15m, /showsignals")
     app.run_polling()
 
 if __name__ == "__main__":
