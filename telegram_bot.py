@@ -1,5 +1,5 @@
 """
-Polymarket Advisory Bot – Uses your price oracle for real‑time signals.
+Polymarket Advisory Bot – Debug version with oracle connectivity test.
 """
 
 import os
@@ -24,10 +24,14 @@ def get_oracle_price(asset='btc', interval='5m'):
         return None, None
     try:
         url = f"{ORACLE_URL}/api/price/{asset}/{interval}"
-        resp = requests.get(url, timeout=5)
+        print(f"Fetching: {url}")
+        resp = requests.get(url, timeout=10)  # increased timeout
+        print(f"Response status: {resp.status_code}")
         if resp.status_code == 200:
             data = resp.json()
             return data.get('up'), data.get('down')
+        else:
+            print(f"Oracle returned {resp.status_code}: {resp.text[:200]}")
     except Exception as e:
         print(f"Oracle error: {e}")
     return None, None
@@ -35,15 +39,13 @@ def get_oracle_price(asset='btc', interval='5m'):
 def get_recommendation(interval='5m'):
     up, down = get_oracle_price('btc', interval)
     if up is None or down is None:
-        return f"⚠️ Could not fetch prices for BTC {interval}. Oracle may be down."
+        return f"⚠️ Could not fetch prices for BTC {interval}. Check /testoracle."
 
-    # Simple strategy: buy YES if up < 0.20, buy NO if down < 0.20
-    # You can adjust the threshold or add more logic.
     THRESHOLD = 0.20
     if up < THRESHOLD:
         side = "YES"
         market_price = up
-        fair_value = THRESHOLD + 0.05  # example fair value
+        fair_value = THRESHOLD + 0.05
     elif down < THRESHOLD:
         side = "NO"
         market_price = down
@@ -54,8 +56,7 @@ def get_recommendation(interval='5m'):
             f"⏸️ *NO TRADE*\n"
             f"Up price: ${up:.3f}\n"
             f"Down price: ${down:.3f}\n"
-            f"Threshold: ${THRESHOLD:.2f}\n"
-            f"No side is below threshold."
+            f"Threshold: ${THRESHOLD:.2f}"
         )
 
     edge = (fair_value - market_price) / market_price if market_price > 0 else 0
@@ -65,7 +66,6 @@ def get_recommendation(interval='5m'):
         f"Current {side} price: ${market_price:.3f}\n"
         f"Fair value estimate: ${fair_value:.3f}\n"
         f"Edge: {edge*100:.1f}%\n"
-        f"Suggested stake: $1.00\n"
         f"Place a limit order."
     )
     return msg
@@ -74,13 +74,13 @@ def get_recommendation(interval='5m'):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🤖 *Polymarket Advisory Bot*\n\n"
-        "I use your price oracle to recommend trades on BTC up/down markets.\n\n"
+        "I use your price oracle to recommend trades.\n\n"
         "*Commands:*\n"
         "/signalbtc5m – recommendation for 5‑minute market\n"
         "/signalbtc15m – recommendation for 15‑minute market\n"
+        "/testoracle – test connection to your oracle\n"
         "/status – Check oracle health\n"
-        "/ping – Alive check\n"
-        "/help – This message",
+        "/ping – Alive check",
         parse_mode='Markdown'
     )
 
@@ -92,6 +92,18 @@ async def signal_btc15m(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = get_recommendation('15m')
     await update.message.reply_text(msg, parse_mode='Markdown')
 
+async def test_oracle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Test direct connection to the oracle."""
+    if not ORACLE_URL:
+        await update.message.reply_text("❌ PRICE_ORACLE_URL not set in environment.")
+        return
+    url = f"{ORACLE_URL}/api/price/btc/5m"
+    try:
+        resp = requests.get(url, timeout=10)
+        await update.message.reply_text(f"✅ Oracle responded with status {resp.status_code}\n{resp.text[:300]}")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error connecting to oracle: {e}")
+
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     up5, down5 = get_oracle_price('btc', '5m')
     up15, down15 = get_oracle_price('btc', '15m')
@@ -99,12 +111,12 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📡 *Oracle Health*\n"
         f"BTC 5m – up: {up5}, down: {down5}\n"
         f"BTC 15m – up: {up15}, down: {down15}\n\n"
-        "Bot is ready. Use /signalbtc5m or /signalbtc15m."
+        "Use /testoracle for more details."
     )
     await update.message.reply_text(status_msg, parse_mode='Markdown')
 
 async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🏓 Pong! Bot is alive.")
+    await update.message.reply_text("🏓 Pong!")
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await start(update, context)
@@ -116,9 +128,10 @@ def main():
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("ping", ping))
     app.add_handler(CommandHandler("status", status))
+    app.add_handler(CommandHandler("testoracle", test_oracle))
     app.add_handler(CommandHandler("signalbtc5m", signal_btc5m))
     app.add_handler(CommandHandler("signalbtc15m", signal_btc15m))
-    print("🤖 Advisory bot started. Using oracle at:", ORACLE_URL)
+    print("🤖 Advisory bot started. Oracle URL:", ORACLE_URL)
     app.run_polling()
 
 if __name__ == "__main__":
