@@ -1,5 +1,5 @@
 """
-Polymarket Advisory Bot – Uses real order book ask prices.
+Polymarket Advisory Bot – Uses real order book ask prices (clobTokenIds).
 """
 
 import os
@@ -64,8 +64,8 @@ def get_recommendation(interval='5m'):
     if not market:
         return f"⚠️ Could not find BTC {interval} market. Try again later."
 
-    # Extract token IDs
-    token_ids = market.get('clob_token_ids')
+    # Extract token IDs – note: field is 'clobTokenIds'
+    token_ids = market.get('clobTokenIds')
     if isinstance(token_ids, str):
         token_ids = json.loads(token_ids)
     if not token_ids or len(token_ids) < 2:
@@ -136,7 +136,7 @@ def main():
     app.add_handler(CommandHandler("ping", ping))
     app.add_handler(CommandHandler("signalbtc5m", signal_btc5m))
     app.add_handler(CommandHandler("signalbtc15m", signal_btc15m))
-    print("Advisory bot started (order book based).")
+    print("Advisory bot started (order book based, using clobTokenIds).")
     app.run_polling()
 
 if __name__ == "__main__":
