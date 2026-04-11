@@ -1,12 +1,10 @@
 """
-Polymarket Advisory Bot – Uses real order book ask prices.
-Includes /debug command to inspect clobTokenIds.
+Polymarket Advisory Bot – Uses bestAsk/bestBid from market data.
 """
 
 import os
 import time
 import requests
-import json
 from datetime import datetime
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
@@ -18,7 +16,7 @@ TOKEN = os.getenv("TELEGRAM_TOKEN")
 if not TOKEN:
     raise ValueError("TELEGRAM_TOKEN not set")
 
-def get_market_slug(interval='5m'):
+def get_market_data(interval='5m'):
     period = 300 if interval == '5m' else 900
     now = int(time.time())
     window_start = now - (now % period)
@@ -29,7 +27,7 @@ def get_market_slug(interval='5m'):
         if resp.status_code == 200:
             data = resp.json()
             if data:
-                return slug, data[0]
+                return data[0]
     except:
         pass
     # Fallback to previous window
@@ -41,102 +39,60 @@ def get_market_slug(interval='5m'):
         if resp.status_code == 200:
             data = resp.json()
             if data:
-                return slug, data[0]
-    except:
-        pass
-    return None, None
-
-def get_best_ask(token_id):
-    url = f"https://clob.polymarket.com/book?token_id={token_id}"
-    try:
-        resp = requests.get(url, timeout=5)
-        if resp.status_code == 200:
-            book = resp.json()
-            asks = book.get('asks', [])
-            if asks:
-                return float(asks[0][0])
+                return data[0]
     except:
         pass
     return None
 
 def get_recommendation(interval='5m'):
-    slug, market = get_market_slug(interval)
+    market = get_market_data(interval)
     if not market:
         return f"⚠️ Could not find BTC {interval} market. Try again later."
 
-    # Get token IDs – field is 'clobTokenIds' (camelCase)
-    token_ids = market.get('clobTokenIds')
-    if token_ids is None:
-        token_ids = market.get('clob_token_ids')  # fallback
-    if isinstance(token_ids, str):
-        try:
-            token_ids = json.loads(token_ids)
-        except:
-            token_ids = None
-    if not token_ids or len(token_ids) < 2:
-        return f"⚠️ No token IDs for {slug}. Raw value: {market.get('clobTokenIds')}"
+    # Extract the tradable prices
+    best_ask = market.get('bestAsk')      # price to buy UP
+    best_bid = market.get('bestBid')      # price to sell UP
+    if best_ask is None or best_bid is None:
+        return f"⚠️ No bid/ask data for BTC {interval} market."
 
-    up_token = token_ids[0]
-    down_token = token_ids[1]
-
-    ask_up = get_best_ask(up_token)
-    ask_down = get_best_ask(down_token)
-
-    if ask_up is None or ask_down is None:
-        return f"⚠️ Could not fetch order book for {slug}"
+    # Approximate price to buy DOWN as 1 - best_bid (since UP + DOWN ≈ 1)
+    ask_down = 1 - best_bid
 
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     title = market.get('title', f"BTC {interval} market")
+    slug = market.get('slug')
 
-    if ask_up < ask_down:
+    if best_ask < ask_down:
         rec = "BUY UP"
-        edge = (ask_down - ask_up) / ask_up * 100
+        edge = (ask_down - best_ask) / best_ask * 100
         msg = (
             f"📈 *{title}*\n"
             f"Slug: `{slug}`\n\n"
-            f"UP ask (price to buy): ${ask_up:.3f}\n"
-            f"DOWN ask (price to buy): ${ask_down:.3f}\n\n"
+            f"Price to buy UP: ${best_ask:.3f}\n"
+            f"Price to buy DOWN (approx): ${ask_down:.3f}\n\n"
             f"🎯 *Recommendation*: {rec} (cheaper)\n"
             f"📊 Edge: {edge:.1f}%"
         )
     else:
         rec = "BUY DOWN"
-        edge = (ask_up - ask_down) / ask_down * 100
+        edge = (best_ask - ask_down) / ask_down * 100
         msg = (
             f"📈 *{title}*\n"
             f"Slug: `{slug}`\n\n"
-            f"UP ask (price to buy): ${ask_up:.3f}\n"
-            f"DOWN ask (price to buy): ${ask_down:.3f}\n\n"
+            f"Price to buy UP: ${best_ask:.3f}\n"
+            f"Price to buy DOWN (approx): ${ask_down:.3f}\n\n"
             f"🎯 *Recommendation*: {rec} (cheaper)\n"
             f"📊 Edge: {edge:.1f}%"
         )
     return msg + f"\n\n(Data as of {timestamp})"
 
-# ---------- Debug command ----------
-async def debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    slug, market = get_market_slug('5m')
-    if not market:
-        await update.message.reply_text("No market found")
-        return
-    token_ids = market.get('clobTokenIds')
-    if token_ids is None:
-        token_ids = market.get('clob_token_ids')
-    await update.message.reply_text(
-        f"Slug: {slug}\n"
-        f"clobTokenIds: {token_ids}\n"
-        f"Type: {type(token_ids)}\n"
-        f"Length: {len(token_ids) if token_ids else 'N/A'}"
-    )
-
-# ---------- Commands ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🤖 *Polymarket Advisory Bot*\n\n"
-        "I fetch real order book ask prices (what you actually pay) for BTC Up/Down markets.\n\n"
+        "I fetch real-time bid/ask prices for BTC Up/Down markets and recommend the cheaper side.\n\n"
         "Commands:\n"
         "/signalbtc5m – 5‑minute market\n"
         "/signalbtc15m – 15‑minute market\n"
-        "/debug – Show raw token IDs\n"
         "/ping – Alive check",
         parse_mode='Markdown'
     )
@@ -156,10 +112,9 @@ def main():
     app = ApplicationBuilder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("ping", ping))
-    app.add_handler(CommandHandler("debug", debug))
     app.add_handler(CommandHandler("signalbtc5m", signal_btc5m))
     app.add_handler(CommandHandler("signalbtc15m", signal_btc15m))
-    print("Advisory bot started (order book based, clobTokenIds fixed).")
+    print("Advisory bot started (using bestAsk/bestBid).")
     app.run_polling()
 
 if __name__ == "__main__":
