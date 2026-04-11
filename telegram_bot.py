@@ -1,6 +1,6 @@
 """
 Polymarket Advisory Bot – Uses real order book ask prices.
-Handles clobTokenIds as list or string.
+Includes /debug command to inspect clobTokenIds.
 """
 
 import os
@@ -36,11 +36,14 @@ def get_market_slug(interval='5m'):
     window_start -= period
     slug = f"btc-updown-{interval}-{window_start}"
     url = f"https://gamma-api.polymarket.com/markets?slug={slug}"
-    resp = requests.get(url, timeout=10)
-    if resp.status_code == 200:
-        data = resp.json()
-        if data:
-            return slug, data[0]
+    try:
+        resp = requests.get(url, timeout=10)
+        if resp.status_code == 200:
+            data = resp.json()
+            if data:
+                return slug, data[0]
+    except:
+        pass
     return None, None
 
 def get_best_ask(token_id):
@@ -64,12 +67,14 @@ def get_recommendation(interval='5m'):
     # Get token IDs – field is 'clobTokenIds' (camelCase)
     token_ids = market.get('clobTokenIds')
     if token_ids is None:
-        # Fallback to old key (just in case)
-        token_ids = market.get('clob_token_ids')
+        token_ids = market.get('clob_token_ids')  # fallback
     if isinstance(token_ids, str):
-        token_ids = json.loads(token_ids)
+        try:
+            token_ids = json.loads(token_ids)
+        except:
+            token_ids = None
     if not token_ids or len(token_ids) < 2:
-        return f"⚠️ No token IDs for {slug}"
+        return f"⚠️ No token IDs for {slug}. Raw value: {market.get('clobTokenIds')}"
 
     up_token = token_ids[0]
     down_token = token_ids[1]
@@ -107,6 +112,23 @@ def get_recommendation(interval='5m'):
         )
     return msg + f"\n\n(Data as of {timestamp})"
 
+# ---------- Debug command ----------
+async def debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    slug, market = get_market_slug('5m')
+    if not market:
+        await update.message.reply_text("No market found")
+        return
+    token_ids = market.get('clobTokenIds')
+    if token_ids is None:
+        token_ids = market.get('clob_token_ids')
+    await update.message.reply_text(
+        f"Slug: {slug}\n"
+        f"clobTokenIds: {token_ids}\n"
+        f"Type: {type(token_ids)}\n"
+        f"Length: {len(token_ids) if token_ids else 'N/A'}"
+    )
+
+# ---------- Commands ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🤖 *Polymarket Advisory Bot*\n\n"
@@ -114,6 +136,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Commands:\n"
         "/signalbtc5m – 5‑minute market\n"
         "/signalbtc15m – 15‑minute market\n"
+        "/debug – Show raw token IDs\n"
         "/ping – Alive check",
         parse_mode='Markdown'
     )
@@ -133,6 +156,7 @@ def main():
     app = ApplicationBuilder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("ping", ping))
+    app.add_handler(CommandHandler("debug", debug))
     app.add_handler(CommandHandler("signalbtc5m", signal_btc5m))
     app.add_handler(CommandHandler("signalbtc15m", signal_btc15m))
     print("Advisory bot started (order book based, clobTokenIds fixed).")
