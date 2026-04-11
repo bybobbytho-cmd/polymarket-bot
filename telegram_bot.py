@@ -1,5 +1,6 @@
 """
-Polymarket Advisory Bot – Uses real order book ask prices (clobTokenIds).
+Polymarket Advisory Bot – Uses real order book ask prices.
+Handles clobTokenIds as list or string.
 """
 
 import os
@@ -17,11 +18,9 @@ TOKEN = os.getenv("TELEGRAM_TOKEN")
 if not TOKEN:
     raise ValueError("TELEGRAM_TOKEN not set")
 
-# ---------- Helper: get current market slug (with fallback) ----------
 def get_market_slug(interval='5m'):
     period = 300 if interval == '5m' else 900
     now = int(time.time())
-    # Try current window
     window_start = now - (now % period)
     slug = f"btc-updown-{interval}-{window_start}"
     url = f"https://gamma-api.polymarket.com/markets?slug={slug}"
@@ -44,7 +43,6 @@ def get_market_slug(interval='5m'):
             return slug, data[0]
     return None, None
 
-# ---------- Helper: get best ask price for a token ID ----------
 def get_best_ask(token_id):
     url = f"https://clob.polymarket.com/book?token_id={token_id}"
     try:
@@ -53,19 +51,21 @@ def get_best_ask(token_id):
             book = resp.json()
             asks = book.get('asks', [])
             if asks:
-                return float(asks[0][0])  # best ask price
+                return float(asks[0][0])
     except:
         pass
     return None
 
-# ---------- Recommendation ----------
 def get_recommendation(interval='5m'):
     slug, market = get_market_slug(interval)
     if not market:
         return f"⚠️ Could not find BTC {interval} market. Try again later."
 
-    # Extract token IDs – note: field is 'clobTokenIds'
+    # Get token IDs – field is 'clobTokenIds' (camelCase)
     token_ids = market.get('clobTokenIds')
+    if token_ids is None:
+        # Fallback to old key (just in case)
+        token_ids = market.get('clob_token_ids')
     if isinstance(token_ids, str):
         token_ids = json.loads(token_ids)
     if not token_ids or len(token_ids) < 2:
@@ -107,7 +107,6 @@ def get_recommendation(interval='5m'):
         )
     return msg + f"\n\n(Data as of {timestamp})"
 
-# ---------- Commands ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🤖 *Polymarket Advisory Bot*\n\n"
@@ -136,7 +135,7 @@ def main():
     app.add_handler(CommandHandler("ping", ping))
     app.add_handler(CommandHandler("signalbtc5m", signal_btc5m))
     app.add_handler(CommandHandler("signalbtc15m", signal_btc15m))
-    print("Advisory bot started (order book based, using clobTokenIds).")
+    print("Advisory bot started (order book based, clobTokenIds fixed).")
     app.run_polling()
 
 if __name__ == "__main__":
