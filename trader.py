@@ -1,15 +1,13 @@
 """
 Polymarket Trading Bot with Regime Detection
-Telegram Commands | $1 per trade | Full logging | Pattern tracking
+Time window: ONLY trade when 150-210 seconds remaining (2.5-3.5 min into 5-min market)
+Hold until expiration | Silent trading | Hourly reports
 """
 
 import time
-import requests
 import csv
 import os
-import threading
-from datetime import datetime, timedelta
-from typing import Dict, Optional
+from datetime import datetime
 
 from config import get_live_price_from_oracle, TelegramAlert, Config
 from market_data import get_market_snapshot
@@ -18,110 +16,73 @@ from executor import should_execute
 from journal import PolymarketJournal
 
 # ==================== CONFIGURABLE PARAMETERS ====================
-POSITION_SIZE_USD = 1.0      # $1 per trade
-MAX_POSITIONS = 3             # Maximum concurrent positions
-MIN_CONFIDENCE = 70           # Minimum confidence % to execute
-TRADE_INTERVAL_SECONDS = 60   # Check every 60 seconds
+POSITION_SIZE_USD = 1.0
+MAX_POSITIONS = 3
+MIN_CONFIDENCE = 70
+TRADE_INTERVAL_SECONDS = 30
 REPORT_FILE = "trade_reports.csv"
 RESOLVED_FILE = "resolved_trades.csv"
-PATTERN_FILE = "pattern_analysis.csv"
+
+# TIME WINDOW SETTINGS (seconds remaining in 5-minute market)
+PRIME_WINDOW_START = 150      # 2.5 minutes left
+PRIME_WINDOW_END = 210        # 3.5 minutes left
+LATE_WINDOW_START = 90        # 1.5 minutes left
+LATE_WINDOW_END = 150         # 2.5 minutes left
 # ================================================================
 
-# Global flag for trading state
 trading_active = True
 
 def init_report_files():
-    """Create CSV files for trade reports if they don't exist"""
-    
-    # Trade decisions log
     if not os.path.exists(REPORT_FILE):
         with open(REPORT_FILE, 'w', newline='') as f:
             writer = csv.writer(f)
             writer.writerow([
-                "timestamp", "slug", "regime", "confidence", "verdict",
+                "timestamp", "slug", "time_remaining_sec", "regime", "confidence", "verdict",
                 "direction", "outcome", "price", "size_usd", "shares",
                 "obi", "velocity", "cme_basis", "polymarket_up", 
-                "polymarket_down", "distance_to_strike", "rsi_1h",
-                "time_remaining_sec", "reason"
+                "polymarket_down", "distance_to_strike", "reason"
             ])
     
-    # Resolved trades log
     if not os.path.exists(RESOLVED_FILE):
-        with open(RESOLVED_FILE, 'a', newline='') as f:
+        with open(RESOLVED_FILE, 'w', newline='') as f:
             writer = csv.writer(f)
             writer.writerow([
                 "entry_timestamp", "exit_timestamp", "slug", "direction", 
                 "outcome", "entry_price", "exit_price", "size_usd", 
                 "shares", "pnl_usd", "pnl_percent", "result", "regime",
-                "entry_obi", "entry_velocity", "entry_cme_basis", "entry_distance"
-            ])
-    
-    # Pattern analysis log (hourly aggregated)
-    if not os.path.exists(PATTERN_FILE):
-        with open(PATTERN_FILE, 'a', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow([
-                "date_hour", "total_decisions", "executes", "passes",
-                "wins", "losses", "win_rate", "avg_confidence",
-                "regime_whale_wins", "regime_gravity_wins", "regime_chaos_wins"
+                "entry_time_remaining", "entry_obi", "entry_velocity", 
+                "entry_cme_basis", "entry_distance"
             ])
 
 def log_trade_decision(data):
-    """Log trade decision to CSV"""
     with open(REPORT_FILE, 'a', newline='') as f:
         writer = csv.writer(f)
         writer.writerow([
-            data.get('timestamp'),
-            data.get('slug'),
-            data.get('regime'),
-            data.get('confidence'),
-            data.get('verdict'),
-            data.get('direction'),
-            data.get('outcome'),
-            data.get('price'),
-            data.get('size_usd'),
-            data.get('shares'),
-            data.get('obi'),
-            data.get('velocity'),
-            data.get('cme_basis'),
-            data.get('polymarket_up'),
-            data.get('polymarket_down'),
-            data.get('distance_to_strike'),
-            data.get('rsi_1h'),
-            data.get('time_remaining'),
-            data.get('reason')
+            data.get('timestamp'), data.get('slug'), data.get('time_remaining'),
+            data.get('regime'), data.get('confidence'), data.get('verdict'),
+            data.get('direction'), data.get('outcome'), data.get('price'),
+            data.get('size_usd'), data.get('shares'), data.get('obi'),
+            data.get('velocity'), data.get('cme_basis'), data.get('polymarket_up'),
+            data.get('polymarket_down'), data.get('distance_to_strike'), data.get('reason')
         ])
 
 def log_resolved_trade(entry, exit_price, pnl_usd, pnl_percent, result):
-    """Log resolved trade to CSV with full context for pattern analysis"""
     with open(RESOLVED_FILE, 'a', newline='') as f:
         writer = csv.writer(f)
         writer.writerow([
-            entry['entry_time'],
-            datetime.utcnow().isoformat(),
-            entry['slug'],
-            entry['direction'],
-            entry['outcome'],
-            entry['entry_price'],
-            exit_price,
-            entry['size_usd'],
-            entry['shares'],
-            pnl_usd,
-            pnl_percent,
-            result,
-            entry['regime'],
-            entry.get('entry_obi'),
-            entry.get('entry_velocity'),
-            entry.get('entry_cme_basis'),
-            entry.get('entry_distance')
+            entry['entry_time'], datetime.utcnow().isoformat(), entry['slug'],
+            entry['direction'], entry['outcome'], entry['entry_price'], exit_price,
+            entry['size_usd'], entry['shares'], pnl_usd, pnl_percent, result,
+            entry['regime'], entry.get('entry_time_remaining'),
+            entry.get('entry_obi'), entry.get('entry_velocity'),
+            entry.get('entry_cme_basis'), entry.get('entry_distance')
         ])
 
 
 class RegimeTrader:
     def __init__(self, journal: PolymarketJournal, capital: float, telegram_token=None, telegram_chat_id=None):
         self.journal = journal
-        self.capital = capital
-        self.positions = {}  # slug -> position details
+        self.positions = {}
         self.total_trades = 0
         self.total_pnl = 0.0
         self.wins = 0
@@ -130,7 +91,6 @@ class RegimeTrader:
         self.running = True
         self.telegram = None
         
-        # Pattern tracking
         self.regime_stats = {
             'WHALE_REGIME': {'wins': 0, 'losses': 0, 'trades': 0},
             'GRAVITY_REGIME': {'wins': 0, 'losses': 0, 'trades': 0},
@@ -143,32 +103,40 @@ class RegimeTrader:
             self.telegram = TelegramAlert(telegram_token, telegram_chat_id)
     
     def send_telegram(self, message):
-        """Send Telegram alert"""
         if self.telegram:
             self.telegram.send_message(message)
+    
+    def get_time_remaining(self, slug):
+        try:
+            timestamp = int(slug.split('-')[-1])
+            window_end = timestamp + 300
+            now = int(datetime.utcnow().timestamp())
+            remaining = window_end - now
+            return max(0, remaining)
+        except:
+            return 300
+    
+    def get_size_multiplier(self, time_remaining):
+        if PRIME_WINDOW_START <= time_remaining <= PRIME_WINDOW_END:
+            return 1.0
+        elif LATE_WINDOW_START <= time_remaining < PRIME_WINDOW_START:
+            return 0.5
         else:
-            print(f"📱 TELEGRAM: {message}")
+            return 0
     
     def get_current_market_data(self):
-        """Get all data needed for trading decision"""
-        
-        # Get Polymarket prices from Oracle
         up, down, slug = get_live_price_from_oracle('btc', '5m')
         if not up:
             return None
         
-        # Get Binance/CME data
+        time_remaining = self.get_time_remaining(slug)
         snapshot = get_market_snapshot()
-        
-        # Calculate distance to strike
         strike = snapshot['spot_price'] - 50 if snapshot['spot_price'] else 75000
         distance = snapshot['spot_price'] - strike if snapshot['spot_price'] else 0
         
-        # Calculate time remaining in market (approx 5 minutes)
-        time_remaining = 300  # Default 5 minutes
-        
         return {
             'slug': slug,
+            'time_remaining': time_remaining,
             'polymarket_up': up,
             'polymarket_down': down,
             'spot_price': snapshot['spot_price'],
@@ -176,27 +144,31 @@ class RegimeTrader:
             'velocity': snapshot['velocity'],
             'cme_basis': snapshot['cme_basis'],
             'distance_to_strike': distance,
-            'time_remaining': time_remaining,
-            'rsi_1h': 50,  # Placeholder
             'timestamp': datetime.utcnow().isoformat()
         }
 
     def analyze_market(self, market_data):
-        """Run regime detection and return trade verdict"""
-        
         distance = abs(market_data['distance_to_strike'])
+        time_remaining = market_data['time_remaining']
         
-        # Detect regime
+        size_mult = self.get_size_multiplier(time_remaining)
+        if size_mult == 0:
+            return {
+                'execute': False,
+                'reason': f"Time window: {time_remaining}s remaining (trade only between {PRIME_WINDOW_START}-{PRIME_WINDOW_END}s)",
+                'regime': 'TIME_WINDOW',
+                'confidence': 0
+            }
+        
         regime, trade_dir, confidence, regime_reason = detect_regime(
             obi=market_data['obi'],
             cme_delta=market_data['cme_basis'],
             distance_to_strike=distance,
             velocity=market_data['velocity'],
-            rsi_1h=market_data.get('rsi_1h', 50)
+            rsi_1h=50
         )
         
-        # Get execution decision
-        execute, direction, size_mult, exec_reason = should_execute(
+        execute, direction, _, exec_reason = should_execute(
             regime=regime,
             trade_direction=trade_dir,
             price_position=market_data['distance_to_strike'],
@@ -204,29 +176,19 @@ class RegimeTrader:
             confidence=confidence
         )
         
-        # Calculate position size
         if execute and direction and confidence >= MIN_CONFIDENCE and trading_active:
             size_usd = POSITION_SIZE_USD * size_mult
-            
-            if direction == "UP":
-                buy_price = market_data['polymarket_up']
-                outcome = "YES"
-            else:
-                buy_price = market_data['polymarket_down']
-                outcome = "NO"
-            
+            buy_price = market_data['polymarket_up'] if direction == "UP" else market_data['polymarket_down']
+            outcome = "YES" if direction == "UP" else "NO"
             shares = size_usd / buy_price if buy_price > 0 else 0
             
+            window_type = "PRIME" if size_mult == 1.0 else "LATE"
+            
             return {
-                'execute': True,
-                'direction': direction,
-                'outcome': outcome,
-                'price': buy_price,
-                'size_usd': size_usd,
-                'shares': shares,
-                'confidence': confidence,
-                'regime': regime,
-                'reason': f"{regime_reason} | {exec_reason}"
+                'execute': True, 'direction': direction, 'outcome': outcome,
+                'price': buy_price, 'size_usd': size_usd, 'shares': shares,
+                'confidence': confidence, 'regime': regime,
+                'reason': f"[{window_type} WINDOW] {regime_reason} | {exec_reason}"
             }
         
         return {
@@ -237,25 +199,18 @@ class RegimeTrader:
         }
 
     def execute_trade(self, analysis, market_data):
-        """Execute a trade"""
-        if not analysis['execute']:
-            return None
-        
-        slug = market_data['slug']
-        if slug in self.positions:
-            return None
-        
-        if len(self.positions) >= MAX_POSITIONS:
+        if not analysis['execute'] or market_data['slug'] in self.positions or len(self.positions) >= MAX_POSITIONS:
             return None
         
         position = {
-            'slug': slug,
+            'slug': market_data['slug'],
             'direction': analysis['direction'],
             'outcome': analysis['outcome'],
             'entry_price': analysis['price'],
             'shares': analysis['shares'],
             'size_usd': analysis['size_usd'],
             'entry_time': datetime.utcnow().isoformat(),
+            'entry_time_remaining': market_data['time_remaining'],
             'regime': analysis['regime'],
             'confidence': analysis['confidence'],
             'entry_obi': market_data['obi'],
@@ -264,21 +219,13 @@ class RegimeTrader:
             'entry_distance': market_data['distance_to_strike']
         }
         
-        self.positions[slug] = position
+        self.positions[market_data['slug']] = position
         self.total_trades += 1
         
-        # Log to journal
-        self.journal.record_signal(
-            market=slug,
-            price=analysis['price'],
-            confidence=analysis['confidence'],
-            action=f"BUY_{analysis['outcome']}"
-        )
-        
-        # Log to CSV
         log_data = {
             'timestamp': market_data['timestamp'],
-            'slug': slug,
+            'slug': market_data['slug'],
+            'time_remaining': market_data['time_remaining'],
             'regime': analysis['regime'],
             'confidence': analysis['confidence'],
             'verdict': 'EXECUTE',
@@ -293,149 +240,122 @@ class RegimeTrader:
             'polymarket_up': market_data['polymarket_up'],
             'polymarket_down': market_data['polymarket_down'],
             'distance_to_strike': market_data['distance_to_strike'],
-            'rsi_1h': market_data.get('rsi_1h', 50),
-            'time_remaining': market_data.get('time_remaining', 300),
             'reason': analysis['reason']
         }
         log_trade_decision(log_data)
-        
-        # Send Telegram alert
-        alert = f"""
-🚨 TRADE EXECUTED
-Direction: {analysis['direction']} ({analysis['outcome']})
-Price: ${analysis['price']:.3f}
-Size: ${analysis['size_usd']:.2f}
-Regime: {analysis['regime']}
-Confidence: {analysis['confidence']}%
-OBI: {market_data['obi']:.3f}
-Velocity: {market_data['velocity']:.1f}
-CME Basis: ${market_data['cme_basis']:.1f}
-Distance: ${market_data['distance_to_strike']:.0f}
-Reason: {analysis['reason']}
-        """
-        self.send_telegram(alert)
-        
-        print(f"\n✅ EXECUTED: {analysis['direction']}")
-        print(f"   Price: ${analysis['price']:.3f}")
-        print(f"   Size: ${analysis['size_usd']:.2f}")
-        print(f"   Regime: {analysis['regime']}")
-        
         return position
 
     def check_resolutions(self):
-        """Check if any positions have resolved"""
+        """Check if positions have resolved (market window ended)"""
         slugs_to_remove = []
-        
         for slug, pos in self.positions.items():
             market_data = self.get_current_market_data()
-            if not market_data:
-                continue
             
-            if market_data['slug'] != slug:
+            # If market slug changed, previous market has expired/resolved
+            if market_data and market_data['slug'] != slug:
+                # Market resolved - need to determine actual outcome
+                # For now, mark as resolved (you'll need to fetch actual resolution)
                 slugs_to_remove.append(slug)
-        
-        return slugs_to_remove
-
-    def check_exits(self):
-        """Check if any positions should be closed"""
-        slugs_to_remove = []
-        
-        for slug, pos in self.positions.items():
-            market_data = self.get_current_market_data()
-            if not market_data or market_data['slug'] != slug:
-                continue
-            
-            if pos['outcome'] == 'YES':
-                current_price = market_data['polymarket_up']
-            else:
-                current_price = market_data['polymarket_down']
-            
-            pnl_usd = (current_price - pos['entry_price']) * pos['shares']
-            pnl_percent = (current_price - pos['entry_price']) / pos['entry_price'] * 100
-            
-            should_exit = False
-            exit_reason = ""
-            
-            if pnl_percent >= 20:
-                should_exit = True
-                exit_reason = "Take profit (20%)"
-            elif pnl_percent <= -30:
-                should_exit = True
-                exit_reason = "Stop loss (30%)"
-            
-            if should_exit:
-                result = "WIN" if pnl_usd > 0 else "LOSS"
-                
-                if result == "WIN":
-                    self.wins += 1
-                    self.regime_stats[pos['regime']]['wins'] += 1
-                else:
-                    self.losses += 1
-                    self.regime_stats[pos['regime']]['losses'] += 1
-                self.regime_stats[pos['regime']]['trades'] += 1
-                
-                log_resolved_trade(pos, current_price, pnl_usd, pnl_percent, result)
-                
-                alert = f"""
-📊 POSITION CLOSED
-Slug: {slug}
-Direction: {pos['direction']}
-Entry: ${pos['entry_price']:.3f} → Exit: ${current_price:.3f}
-PnL: ${pnl_usd:.2f} ({pnl_percent:.1f}%)
-Result: {result}
-Regime: {pos['regime']}
-Reason: {exit_reason}
-                """
-                self.send_telegram(alert)
-                
-                print(f"\n📤 EXIT: {slug}")
-                print(f"   PnL: ${pnl_usd:.2f} ({pnl_percent:.1f}%)")
-                print(f"   Result: {result}")
-                
-                self.total_pnl += pnl_usd
-                slugs_to_remove.append(slug)
+                print(f"📊 Market resolved: {slug}")
         
         for slug in slugs_to_remove:
             del self.positions[slug]
 
-    def generate_pattern_report(self):
-        """Generate and send pattern analysis report"""
+    def send_hourly_report(self):
         current_hour = datetime.utcnow().hour
-        
         if current_hour != self.last_report_hour:
             self.last_report_hour = current_hour
             
-            # Calculate win rates by regime
             report = f"""
-📈 PATTERN ANALYSIS REPORT (Hour {current_hour-1}:00 - {current_hour}:00)
+📊 HOURLY REPORT ({current_hour-1}:00 - {current_hour}:00 UTC)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Total Trades: {self.total_trades}
-Wins: {self.wins} | Losses: {self.losses}
+Trades: {self.total_trades} | Wins: {self.wins} | Losses: {self.losses}
 Win Rate: {(self.wins/self.total_trades*100) if self.total_trades > 0 else 0:.1f}%
-Total PnL: ${self.total_pnl:.2f}
+PnL: ${self.total_pnl:.2f} | Active: {len(self.positions)}
 
-📊 REGIME PERFORMANCE:
+📈 REGIME BREAKDOWN:
 """
             for regime, stats in self.regime_stats.items():
                 if stats['trades'] > 0:
-                    win_rate = stats['wins'] / stats['trades'] * 100
-                    report += f"{regime}: {stats['wins']}W/{stats['losses']}L ({win_rate:.0f}%)\n"
+                    wr = stats['wins'] / stats['trades'] * 100
+                    report += f"{regime}: {stats['wins']}W/{stats['losses']}L ({wr:.0f}%)\n"
             
-            report += f"""
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Active Positions: {len(self.positions)}
-            """
             self.send_telegram(report)
-            print(f"\n📊 Pattern report sent")
 
-    def get_status_message(self):
-        """Generate status message for /status command"""
-        active_positions = ""
-        for slug, pos in self.positions.items():
-            active_positions += f"\n• {pos['direction']} @ ${pos['entry_price']:.3f} (${pos['size_usd']:.2f})"
+    # ========== COMMAND HANDLERS ==========
+    
+    def cmd_btc5m(self):
+        up, down, slug = get_live_price_from_oracle('btc', '5m')
+        if not up:
+            return "❌ Oracle not responding"
         
-        if not active_positions:
-            active_positions = "\n• No active positions"
+        time_remaining = self.get_time_remaining(slug)
+        minutes = time_remaining // 60
+        seconds = time_remaining % 60
+        
+        size_mult = self.get_size_multiplier(time_remaining)
+        window_status = "✅ PRIME WINDOW" if size_mult == 1.0 else "⚠️ LATE WINDOW" if size_mult == 0.5 else "❌ NOT IN WINDOW"
+        snapshot = get_market_snapshot()
+        
+        return f"""
+📡 LIVE ORACLE DATA - BTC 5m
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🎯 PRICES:
+   UP (YES): {up:.3f} ({up*100:.1f}%)
+   DOWN (NO): {down:.3f} ({down*100:.1f}%)
+
+⏰ TIME REMAINING: {minutes}m {seconds}s
+   {window_status} (trade window: {PRIME_WINDOW_START}-{PRIME_WINDOW_END}s)
+
+📈 MARKET CONTEXT:
+   OBI: {snapshot['obi']:.4f}
+   Velocity: {snapshot['velocity']:.1f} USD/min
+   CME Basis: ${snapshot['cme_basis']:.2f}
+
+💡 Bot will only trade if time remaining is between {PRIME_WINDOW_START}-{PRIME_WINDOW_END} seconds.
+        """
+
+    def cmd_check(self):
+        market_data = self.get_current_market_data()
+        if not market_data:
+            return "❌ Cannot fetch market data"
+        
+        distance = abs(market_data['distance_to_strike'])
+        time_remaining = market_data['time_remaining']
+        
+        regime, trade_dir, confidence, reason = detect_regime(
+            obi=market_data['obi'], cme_delta=market_data['cme_basis'],
+            distance_to_strike=distance, velocity=market_data['velocity'], rsi_1h=50
+        )
+        
+        size_mult = self.get_size_multiplier(time_remaining)
+        minutes = time_remaining // 60
+        seconds = time_remaining % 60
+        
+        return f"""
+🔍 MARKET CHECK (Manual)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🎯 POLYMARKET:
+   UP: {market_data['polymarket_up']:.3f} | DOWN: {market_data['polymarket_down']:.3f}
+
+⏰ TIME: {minutes}m {seconds}s remaining
+   {'✅ IN TRADE WINDOW' if size_mult > 0 else '❌ NOT IN TRADE WINDOW'}
+
+📈 DATA:
+   OBI: {market_data['obi']:.4f} {'🐋' if abs(market_data['obi']) > 0.6 else '⚖️'}
+   Velocity: {market_data['velocity']:.1f} USD/min
+   CME Basis: ${market_data['cme_basis']:.2f}
+
+🎯 REGIME: {regime} ({confidence}% confidence)
+   {reason}
+
+💡 Bot would {'EXECUTE ' + trade_dir if trade_dir != 'NONE' else 'PASS'} based on current rules.
+        """
+
+    def cmd_status(self):
+        active = ""
+        for slug, pos in self.positions.items():
+            active += f"\n• {pos['direction']} @ ${pos['entry_price']:.3f} (${pos['size_usd']:.2f})"
         
         return f"""
 🤖 BOT STATUS
@@ -445,67 +365,58 @@ Total Trades: {self.total_trades}
 Wins: {self.wins} | Losses: {self.losses}
 Win Rate: {(self.wins/self.total_trades*100) if self.total_trades > 0 else 0:.1f}%
 Total PnL: ${self.total_pnl:.2f}
-Active Positions:{active_positions}
+Active Positions:{active or ' None'}
 ━━━━━━━━━━━━━━━━━━━━━━━
-Position Size: ${POSITION_SIZE_USD}
-Max Positions: {MAX_POSITIONS}
-Min Confidence: {MIN_CONFIDENCE}%
+Trade Window: {PRIME_WINDOW_START}-{PRIME_WINDOW_END}s remaining
+Position Size: ${POSITION_SIZE_USD} | Max: {MAX_POSITIONS}
+        """
+
+    def cmd_help(self):
+        return """
+🤖 AVAILABLE COMMANDS:
+━━━━━━━━━━━━━━━━━━━━━━━
+/start     - Start trading
+/stop      - Pause trading
+/status    - Show bot status and PnL
+/check     - Manual market check (no trade)
+/btc5m     - Live prices from Oracle
+/export    - Download CSV trade reports
+/help      - Show this message
+
+⏰ TRADE WINDOW: Only trades when 2.5-3.5 minutes remaining
+💰 Position Size: $1 per trade
+📊 Hold until expiration (no early exit)
         """
 
     def run_cycle(self):
-        """Main trading cycle"""
         if not trading_active:
             return
         
-        print(f"\n{'='*60}")
-        print(f"🔄 Trading Cycle - {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC")
-        print(f"   Active positions: {len(self.positions)}")
-        print(f"   Total PnL: ${self.total_pnl:.2f}")
-        print(f"{'='*60}")
-        
-        self.check_exits()
-        self.generate_pattern_report()
+        self.check_resolutions()
+        self.send_hourly_report()
         
         market_data = self.get_current_market_data()
         if not market_data:
-            print("❌ No market data available")
             return
-        
-        print(f"\n📊 Market: {market_data['slug']}")
-        print(f"   UP: {market_data['polymarket_up']:.3f} | DOWN: {market_data['polymarket_down']:.3f}")
-        print(f"   OBI: {market_data['obi']:.4f} | Velocity: {market_data['velocity']:.2f}")
-        print(f"   CME Basis: ${market_data['cme_basis']:.2f}")
         
         analysis = self.analyze_market(market_data)
         
-        print(f"\n🎯 Regime: {analysis['regime']} (Confidence: {analysis['confidence']}%)")
-        
         if analysis['execute']:
-            print(f"   ✅ Verdict: EXECUTE {analysis['direction']}")
             self.execute_trade(analysis, market_data)
         else:
-            print(f"   ❌ Verdict: PASS")
-            print(f"   Reason: {analysis['reason']}")
-            
             log_data = {
                 'timestamp': market_data['timestamp'],
                 'slug': market_data['slug'],
+                'time_remaining': market_data['time_remaining'],
                 'regime': analysis['regime'],
                 'confidence': analysis['confidence'],
                 'verdict': 'PASS',
-                'direction': '',
-                'outcome': '',
-                'price': '',
-                'size_usd': '',
-                'shares': '',
-                'obi': market_data['obi'],
-                'velocity': market_data['velocity'],
+                'direction': '', 'outcome': '', 'price': '', 'size_usd': '', 'shares': '',
+                'obi': market_data['obi'], 'velocity': market_data['velocity'],
                 'cme_basis': market_data['cme_basis'],
                 'polymarket_up': market_data['polymarket_up'],
                 'polymarket_down': market_data['polymarket_down'],
                 'distance_to_strike': market_data['distance_to_strike'],
-                'rsi_1h': market_data.get('rsi_1h', 50),
-                'time_remaining': market_data.get('time_remaining', 300),
                 'reason': analysis['reason']
             }
             log_trade_decision(log_data)
@@ -515,95 +426,49 @@ Min Confidence: {MIN_CONFIDENCE}%
 
 
 # ============================================================
-# TELEGRAM COMMAND HANDLERS
-# ============================================================
-
-def handle_start(update, context):
-    """/start command - begin trading"""
-    global trading_active
-    trading_active = True
-    update.message.reply_text("✅ Trading started! I'll execute $1 trades when conditions are met.")
-
-def handle_stop(update, context):
-    """/stop command - pause trading"""
-    global trading_active
-    trading_active = False
-    update.message.reply_text("⏸️ Trading paused. Use /start to resume.")
-
-def handle_status(update, context, trader):
-    """/status command - show current status"""
-    status = trader.get_status_message()
-    update.message.reply_text(status)
-
-def handle_export(update, context):
-    """/export command - send CSV files"""
-    if os.path.exists(REPORT_FILE):
-        update.message.reply_document(document=open(REPORT_FILE, 'rb'), filename="trade_reports.csv")
-    if os.path.exists(RESOLVED_FILE):
-        update.message.reply_document(document=open(RESOLVED_FILE, 'rb'), filename="resolved_trades.csv")
-    update.message.reply_text("📁 CSV files sent. Use these for pattern analysis.")
-
-
-# ============================================================
 # MAIN
 # ============================================================
 
 def main():
     print("="*60)
-    print("Polymarket Trading Bot with Pattern Tracking")
-    print("Position Size: $1 per trade")
-    print("Telegram Commands: /start, /stop, /status, /export")
+    print("Polymarket Trading Bot - Time Window Mode")
+    print(f"Trade Window: {PRIME_WINDOW_START}-{PRIME_WINDOW_END}s remaining (2.5-3.5 min into 5-min market)")
+    print("Trades: $1 | Reports: Hourly | Hold until expiration")
     print("="*60)
     
     init_report_files()
-    print("\n📁 Report files initialized")
     
-    # Load config for Telegram
     try:
         config = Config()
         telegram_token = config.telegram_token
         telegram_chat_id = config.telegram_chat_id
-        print("✅ Telegram config loaded")
     except Exception as e:
-        print(f"⚠️ Telegram not configured: {e}")
+        print(f"⚠️ Config error: {e}")
         telegram_token = None
         telegram_chat_id = None
     
-    # Test Oracle connection
-    print("\n🔗 Testing Oracle connection...")
     up, down, slug = get_live_price_from_oracle('btc', '5m')
-    if up:
-        print(f"   ✅ Oracle connected!")
-        print(f"   Current BTC 5m: UP={up:.3f}, DOWN={down:.3f}")
-    else:
-        print("   ❌ Oracle not responding. Exiting.")
+    if not up:
+        print("❌ Oracle not responding")
         return
     
-    # Initialize trader
+    print(f"✅ Oracle connected: UP={up:.3f}, DOWN={down:.3f}")
+    
     journal = PolymarketJournal()
-    trader = RegimeTrader(journal, capital=100.0, telegram_token=telegram_token, telegram_chat_id=telegram_chat_id)
+    trader = RegimeTrader(journal, 100.0, telegram_token, telegram_chat_id)
     
-    # Send startup message
-    trader.send_telegram("🚀 Bot started! Trading with $1 per position.\nCommands: /start, /stop, /status, /export")
+    trader.send_telegram(f"🚀 Bot started!\nTrade window: {PRIME_WINDOW_START}-{PRIME_WINDOW_END}s remaining\nHold until expiration | $1 per trade\nCommands: /check, /btc5m, /status, /export")
     
-    print("\n🚀 Bot is running. Press Ctrl+C to stop.")
-    print("📊 Reports saved to: trade_reports.csv, resolved_trades.csv, pattern_analysis.csv")
+    print("\n🚀 Bot running. Press Ctrl+C to stop.")
     print("="*60)
     
     try:
         while trader.running:
             trader.run_cycle()
-            print(f"\n⏰ Waiting {TRADE_INTERVAL_SECONDS} seconds...")
             time.sleep(TRADE_INTERVAL_SECONDS)
     except KeyboardInterrupt:
         print("\n\n🛑 Bot stopped")
-        print(f"\n📊 FINAL STATISTICS:")
-        print(f"   Total Trades: {trader.total_trades}")
-        print(f"   Wins: {trader.wins} | Losses: {trader.losses}")
-        print(f"   Win Rate: {(trader.wins/trader.total_trades*100) if trader.total_trades > 0 else 0:.1f}%")
-        print(f"   Total PnL: ${trader.total_pnl:.2f}")
-        
-        trader.send_telegram(f"🛑 Bot stopped.\nFinal: {trader.wins}W/{trader.losses}L | PnL: ${trader.total_pnl:.2f}")
+        trader.send_telegram(f"🛑 Bot stopped. Final: {trader.wins}W/{trader.losses}L | PnL: ${trader.total_pnl:.2f}")
 
 if __name__ == "__main__":
     main()
